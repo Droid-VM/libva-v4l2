@@ -51,6 +51,8 @@ sources = [
 	'stateful/session.cc',
 	'stateful/v4l2_device.cc',
 	'stateful/h264_context.cc',
+	'stateful/vp9_bitstream.cc',
+	'stateful/vp9_context.cc',
 	'stateful/gbm_allocator.cc',
 ]
 
@@ -76,6 +78,9 @@ headers = [
 	'stateful/session.h',
 	'stateful/v4l2_device.h',
 	'stateful/h264_context.h',
+	'stateful/frame_view.h',
+	'stateful/vp9_bitstream.h',
+	'stateful/vp9_context.h',
 	'stateful/allocator.h',
 	'stateful/gbm_allocator.h',
 	'stateful/prime_descriptor.h',
@@ -118,6 +123,17 @@ test_bitstream = executable('test_h264_bitstream',
 	cpp_args: cpp_args,
 	dependencies: [ libva_dep, libgstcodecparsers_dep, kernel_dep ])
 test('h264-bitstream', test_bitstream)
+
+# VA2a (VPU_DESIGN.md 7.6; VA2-survey (C)): the VP9 passthrough. The
+# VP9AccessUnitBuilder forwards the slice-data bytes VERBATIM (offset/size
+# honoured, no start code, no parameter injection), and the assembled frame
+# reaches the device OUTPUT plane byte-for-byte through the real session driven
+# against the scripted fake device.
+test_vp9_context = executable('test_vp9_context',
+	[ '../test/stateful/test_vp9_context.cc', 'stateful/vp9_bitstream.cc', 'stateful/session.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, kernel_dep ])
+test('vp9-context', test_vp9_context)
 
 test_session = executable('test_stateful_session',
 	[ '../test/stateful/test_session.cc', 'stateful/session.cc' ],

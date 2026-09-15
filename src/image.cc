@@ -39,12 +39,38 @@ extern "C" {
 #include "buffer.h"
 #include "driver.h"
 #include "format.h"
+#include "stateful/frame_view.h"
 #include "stateful/h264_context.h"
+#include "stateful/vp9_context.h"
 #include "surface.h"
 #include "utils.h"
 #include "v4l2.h"
 
 namespace {
+
+/*
+ * Resolve the shared NV12 view for a surface's stateful context (VA2a). The
+ * codec-agnostic wrappers (sync/release/export/hold_frames/note_derive) are
+ * Context virtuals, but frame_view returns a codec-owned type, so it is
+ * resolved per concrete context here. Both contexts describe the same NV12
+ * CAPTURE buffer, so the result is one stateful::FrameView either way.
+ */
+std::optional<stateful::FrameView> stateful_frame_view(const Surface& surface)
+{
+    Context* context = surface.stateful_context;
+    if (auto* h264 = dynamic_cast<StatefulH264Context*>(context)) {
+        auto view = h264->frame_view(surface);
+        if (!view) {
+            return std::nullopt;
+        }
+        return stateful::FrameView { view->luma, view->chroma, view->pitch, view->coded_width, view->coded_height,
+            view->contiguous };
+    }
+    if (auto* vp9 = dynamic_cast<StatefulVP9Context*>(context)) {
+        return vp9->frame_view(surface);
+    }
+    return std::nullopt;
+}
 
 /* Stateful path (VPU_DESIGN.md 7.6 point 4): row-wise NV12 copy from the
  * claimed CAPTURE buffer's mmap, honouring the G_FMT stride. */
@@ -66,7 +92,7 @@ VAStatus copy_stateful_surface_to_image(DriverData* driver_data, const Surface& 
     /* Hold the session while reading the CAPTURE mmap so a concurrent
      * re-provision cannot unmap it mid-copy. */
     auto frames_guard = surface.stateful_context->hold_frames();
-    auto view = surface.stateful_context->frame_view(surface);
+    auto view = stateful_frame_view(surface);
     if (!view) {
         return VA_STATUS_ERROR_SURFACE_BUSY;
     }
@@ -240,7 +266,7 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
                 return status;
         }
         auto frames_guard = surface.stateful_context->hold_frames();
-        auto view = surface.stateful_context->frame_view(surface);
+        auto view = stateful_frame_view(surface);
         if (!view || view->contiguous.empty()) {
             /* 7.7 (4): explain the OPERATION_FAILED once. The frames guard does
              * not take the driver mutex, and the log helpers do not either, so

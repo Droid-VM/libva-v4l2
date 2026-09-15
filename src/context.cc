@@ -45,6 +45,7 @@ extern "C" {
 #include "h264.h"
 #include "mpeg2.h"
 #include "stateful/h264_context.h"
+#include "stateful/vp9_context.h"
 #include "surface.h"
 #include "utils.h"
 #include "v4l2.h"
@@ -64,6 +65,9 @@ std::set<VAProfile> Context::supported_profiles(const std::vector<V4L2M2MDevice>
             result.insert(profile);
         }
         for (auto&& profile : StatefulH264Context::supported_profiles(device)) {
+            result.insert(profile);
+        }
+        for (auto&& profile : StatefulVP9Context::supported_profiles(device)) {
             result.insert(profile);
         }
         for (auto&& profile : VP8Context::supported_profiles(device)) {
@@ -90,6 +94,9 @@ Context* Context::create(DriverData* driver_data, VAProfile profile, int picture
         }
         if (StatefulH264Context::supported_profiles(device).contains(profile)) {
             return new StatefulH264Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
+        }
+        if (StatefulVP9Context::supported_profiles(device).contains(profile)) {
+            return new StatefulVP9Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
         }
         if (VP8Context::supported_profiles(device).contains(profile)) {
             return new VP8Context(driver_data, device, picture_width, picture_height, surface_ids);

@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <mutex>
 #include <span>
 
 extern "C" {
@@ -62,6 +64,39 @@ public:
         (void)va_context;
         (void)surface;
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    /*
+     * The codec-agnostic stateful-surface interface (VPU_DESIGN.md 7.6/7.7).
+     * A Surface's stateful_context is a Context*, and vaSyncSurface /
+     * vaDestroySurfaces / vaExportSurfaceHandle / the vaGetImage-vaDeriveImage
+     * copies reach the owning stateful context through these. The concrete
+     * stateful contexts (StatefulH264Context, StatefulVP9Context) override
+     * them against their own session; the default no-op/error bodies are never
+     * reached on a stateless context (whose surfaces carry no stateful_context).
+     * frame_view is deliberately NOT here: it returns a codec-owned view type,
+     * so image.cc resolves it per concrete context (see stateful::FrameView).
+     */
+    virtual VAStatus sync_surface(VADriverContextP va_context, Surface& surface)
+    {
+        (void)va_context;
+        (void)surface;
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    virtual void release_surface(Surface& surface) { (void)surface; }
+    virtual VAStatus export_surface(VADriverContextP va_context, Surface& surface, uint32_t flags, void* descriptor)
+    {
+        (void)va_context;
+        (void)surface;
+        (void)flags;
+        (void)descriptor;
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    }
+    virtual std::unique_lock<std::mutex> hold_frames() { return {}; }
+    virtual void note_derive_unavailable(VADriverContextP va_context, bool have_view)
+    {
+        (void)va_context;
+        (void)have_view;
     }
 
     VASurfaceID render_surface_id;
