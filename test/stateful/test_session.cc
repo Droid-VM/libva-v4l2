@@ -316,6 +316,82 @@ void test_idle_drain_on_stream_tail()
     CHECK_EQ(session.idle_drains(), 1u);
 }
 
+void test_reenterable_recovery()
+{
+    /* D86: B18 found recovery was one-shot -- a second drain+restart in a
+     * session, or one before the first SOURCE_CHANGE, ended in a dead
+     * session. Two consecutive recoveries must both yield their frames.
+     * The fake pauses OUTPUT on DEC_CMD_STOP, so a recovery that fails to
+     * re-STREAMON OUTPUT starves the next decode (the one-shot). Named
+     * mutation this fails under: drop the stream_output(true) re-assert in
+     * recover_locked (the second submit throws on the paused queue). */
+    FakeDevice device;
+    device.manual_delivery = true;
+    device.stop_pauses_output = true;
+    StatefulSession::Options options;
+    options.num_surfaces = 6;
+    options.sync_timeout_ms = 30;
+    options.sync_idle_ms = 10;
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+    /* First stall: submit 1, deliver nothing until DEC_CMD_STOP. */
+    session.submit(1, fake_au());
+    device.on_decoder_stop = [&device]() { device.deliver(1, /*last=*/true); };
+    StatefulSession::Frame frame;
+    CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(device.decoder_stops, 1u);
+    CHECK(!session.dead());
+    session.release_frame(frame);
+
+    /* The recovery must have resumed OUTPUT: a second submit succeeds. */
+    session.submit(2, fake_au());
+    device.on_decoder_stop = [&device]() { device.deliver(2, /*last=*/true); };
+    CHECK(session.sync(2, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(device.decoder_stops, 2u); /* the SECOND recovery fired and worked */
+    CHECK_EQ(device.decoder_starts, 2u);
+    CHECK(!session.dead());
+    session.release_frame(frame);
+
+    /* A dropped sequence keeps the session alive and streaming: sync of a
+     * sequence the drain never delivers is a per-surface decode error, not
+     * a dead session, and later frames still decode. */
+    session.submit(3, fake_au());
+    device.on_decoder_stop = [&device]() { device.deliver_empty_last(); };
+    CHECK(session.sync(3, &frame) == StatefulSession::SyncStatus::decode_error);
+    CHECK(!session.dead());
+    session.submit(4, fake_au());
+    device.on_decoder_stop = nullptr;
+    device.deliver(4);
+    CHECK(session.sync(4, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK(!session.dead());
+}
+
+void test_no_drain_before_source_change()
+{
+    /* D86: no timeout/idle drain may fire before the first SOURCE_CHANGE
+     * has been handled -- before provisioning a drain has nowhere to
+     * deliver. A sync that expires while unprovisioned must NOT issue
+     * DEC_CMD_STOP; it waits for the announce and then reports a decode
+     * error, session still alive. Named mutation this fails under: let the
+     * sync loop enter recover_locked while !provisioned_ (a DEC_CMD_STOP
+     * fires at sequence 1). */
+    FakeDevice device;
+    device.manual_delivery = true;
+    device.source_change_pending_on_submit = false; /* the announce never comes */
+    StatefulSession::Options options;
+    options.num_surfaces = 6;
+    options.sync_timeout_ms = 20;
+    options.sync_idle_ms = 5;
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+    session.submit(1, fake_au());
+    StatefulSession::Frame frame;
+    CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::decode_error);
+    CHECK_EQ(device.decoder_stops, 0u); /* never drained before the announce */
+    CHECK(!session.provisioned());
+    CHECK(!session.dead());
+}
+
 void test_output_ring_growth()
 {
     FakeDevice device;
@@ -418,6 +494,8 @@ int main()
     test_stale_release_after_reprovision();
     test_timeout_drain_recovery();
     test_idle_drain_on_stream_tail();
+    test_reenterable_recovery();
+    test_no_drain_before_source_change();
     test_output_ring_growth();
     test_device_lost();
     test_submit_on_dead_device_throws();

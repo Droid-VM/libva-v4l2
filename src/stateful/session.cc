@@ -445,12 +445,31 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
         log(line);
 
         device_.decoder_stop();
-        drain_capture_locked(lock, sync_timeout_ms_);
+        const bool saw_last = drain_capture_locked(lock, sync_timeout_ms_);
         device_.decoder_start();
+
+        /* D86: make the recovery re-enterable. DEC_CMD_STOP's seek can pause
+         * the OUTPUT queue, so re-assert STREAMON(OUTPUT) before feeding
+         * again (idempotent on a queue already streaming); then pump so the
+         * OUTPUT buffers the drain finished are returned to free_outputs_
+         * and queued_outputs_ is right for the next submit. Without this the
+         * second drain in a session starves and the old code let the whole
+         * session die. */
+        if (!capture_streaming_ && provisioned_) {
+            device_.stream_capture(true);
+            capture_streaming_ = true;
+        }
+        device_.stream_output(true);
         pump_locked();
 
         if (claim_locked(sequence, frame)) {
             status = SyncStatus::ok;
+        } else if (saw_last) {
+            /* The drain reached LAST without our frame: the codec dropped
+             * this sequence. Report a decode error for THIS surface only and
+             * leave the session streaming (never dead_ except on
+             * DeviceLost). */
+            status = SyncStatus::decode_error;
         }
     } catch (...) {
         harvesting_ = false;
@@ -497,15 +516,25 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             }
             const auto idle_deadline = idle_since + std::chrono::milliseconds(sync_idle_ms_);
             const bool hard_expired = now >= deadline;
-            const bool idle_expired = provisioned_ && now >= idle_deadline;
+            if (!provisioned_) {
+                /* D86: before the first SOURCE_CHANGE a drain has nowhere to
+                 * deliver -- DEC_CMD_STOP at sequence 1 was exactly what
+                 * killed the B18 session. Wait for the announce up to the
+                 * hard cap, then give up on this surface without a drain;
+                 * the session stays alive for the frames that follow. */
+                if (hard_expired) {
+                    return SyncStatus::decode_error;
+                }
+                wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+                continue;
+            }
+
+            const bool idle_expired = now >= idle_deadline;
             if (hard_expired || idle_expired) {
                 return recover_locked(lock, sequence, frame, idle_expired && !hard_expired);
             }
 
-            int slice = std::min(kWaitSliceMs, remaining_ms(deadline) + 1);
-            if (provisioned_) {
-                slice = std::min(slice, remaining_ms(idle_deadline) + 1);
-            }
+            int slice = std::min({ kWaitSliceMs, remaining_ms(deadline) + 1, remaining_ms(idle_deadline) + 1 });
             wait_for_progress(lock, slice, false);
         }
     } catch (const DeviceLost&) {

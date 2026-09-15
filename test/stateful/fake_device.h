@@ -62,6 +62,12 @@ public:
     bool manual_delivery = false; /* when true, only deliver() produces frames */
     bool lose_device = false;
     bool fail_create_bufs = false;
+    /* Model a stateful decoder whose DEC_CMD_STOP seek pauses the OUTPUT
+     * queue: feeding it again needs STREAMON(OUTPUT) after DEC_CMD_START
+     * (D86). When set, queue_output on a paused queue fails, so a recovery
+     * that does not resume OUTPUT starves the next decode -- the B18
+     * one-shot. */
+    bool stop_pauses_output = false;
     std::function<void()> on_decoder_stop;
 
     /* --- observable state --- */
@@ -157,6 +163,9 @@ public:
     void queue_output(unsigned index, uint64_t sequence, unsigned bytes) override
     {
         check_alive();
+        if (stop_pauses_output && !output_streaming) {
+            throw std::system_error(EPIPE, std::generic_category(), "VIDIOC_QBUF(OUTPUT): queue paused by seek");
+        }
         pending_decodes.push_back({ index, sequence, bytes });
         if (source_change_pending_on_submit) {
             source_change_pending_on_submit = false;
@@ -216,6 +225,9 @@ public:
     {
         check_alive();
         decoder_stops += 1;
+        if (stop_pauses_output) {
+            output_streaming = false; /* the seek pauses OUTPUT until STREAMON */
+        }
         if (on_decoder_stop) {
             on_decoder_stop();
         }
