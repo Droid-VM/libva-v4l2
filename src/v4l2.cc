@@ -159,7 +159,38 @@ std::vector<std::string> enumerate_media_devices(udev* ctx)
     return result;
 }
 
+bool is_stateful_decoder_node(int video_fd, v4l2_buf_type output_type)
+{
+    bool dynamic_resolution = false;
+    bool slice_or_frame = false;
+
+    for (v4l2_fmtdesc fmtdesc = { .type = static_cast<uint32_t>(output_type) };
+         ioctl(video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0; fmtdesc.index += 1) {
+        if (fmtdesc.flags & V4L2_FMT_FLAG_DYN_RESOLUTION) {
+            dynamic_resolution = true;
+        }
+        switch (fmtdesc.pixelformat) {
+        case V4L2_PIX_FMT_MPEG2_SLICE:
+        case V4L2_PIX_FMT_H264_SLICE:
+        case V4L2_PIX_FMT_HEVC_SLICE:
+        case V4L2_PIX_FMT_VP8_FRAME:
+        case V4L2_PIX_FMT_VP9_FRAME:
+            slice_or_frame = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    return dynamic_resolution && !slice_or_frame;
+}
+
 } // namespace
+
+bool V4L2M2MDevice::stateful_decoder() const
+{
+    return is_stateful_decoder_node(video_fd, output_buf_type);
+}
 
 std::vector<std::pair<std::string, std::optional<std::string>>> V4L2M2MDevice::enumerate_devices()
 {
@@ -172,7 +203,52 @@ std::vector<std::pair<std::string, std::optional<std::string>>> V4L2M2MDevice::e
             if (query_capabilities(fd) & required_capabilities) {
                 result.emplace_back(video_device, media_device);
             }
+            close(fd);
         }
+    }
+
+    /* Stateful decoders (VPU_DESIGN.md 7.6 point 1) have no media controller
+     * node, so the media-driven walk above cannot find them: also probe the
+     * video4linux subsystem directly and keep M2M nodes whose coded formats
+     * mark them stateful. */
+    std::unique_ptr<udev_enumerate, decltype(&udev_enumerate_unref)> video_enumerate(
+        udev_enumerate_new(ctx.get()), &udev_enumerate_unref);
+    udev_enumerate_add_match_subsystem(video_enumerate.get(), "video4linux");
+    udev_enumerate_scan_devices(video_enumerate.get());
+
+    for (auto entry = udev_enumerate_get_list_entry(video_enumerate.get()); entry != nullptr;
+         entry = udev_list_entry_get_next(entry)) {
+        std::unique_ptr<udev_device, decltype(&udev_device_unref)> device(
+            udev_device_new_from_syspath(ctx.get(), udev_list_entry_get_name(entry)), &udev_device_unref);
+        if (!device) {
+            continue;
+        }
+        const char* devname = udev_device_get_property_value(device.get(), "DEVNAME");
+        if (devname == nullptr) {
+            continue;
+        }
+        const std::string video_device(devname);
+        if (std::ranges::any_of(result, [&](auto&& r) { return r.first == video_device; })) {
+            continue;
+        }
+
+        int fd = open(video_device.c_str(), O_RDONLY);
+        if (fd < 0) {
+            continue;
+        }
+        try {
+            uint32_t capabilities = query_capabilities(fd);
+            if (capabilities & required_capabilities) {
+                v4l2_buf_type output_type = (capabilities & V4L2_CAP_VIDEO_M2M) ? V4L2_BUF_TYPE_VIDEO_OUTPUT
+                                                                                : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+                if (is_stateful_decoder_node(fd, output_type)) {
+                    result.emplace_back(video_device, std::nullopt);
+                }
+            }
+        } catch (const std::exception&) {
+            /* Not a usable node; keep probing the others. */
+        }
+        close(fd);
     }
 
     return result;
@@ -349,6 +425,7 @@ unsigned V4L2M2MDevice::request_buffers(v4l2_buf_type type, unsigned count)
     };
 
     errno_wrapper(ioctl, video_fd, VIDIOC_REQBUFS, &req_buffers);
+    buffer_capabilities = req_buffers.capabilities;
 
     auto& buffers = V4L2_TYPE_IS_CAPTURE(type) ? capture_buffers : output_buffers;
 
@@ -375,7 +452,8 @@ const V4L2M2MDevice::Buffer& V4L2M2MDevice::buffer(v4l2_buf_type type, unsigned 
     return (V4L2_TYPE_IS_CAPTURE(type) ? capture_buffers : output_buffers)[index];
 }
 
-int32_t V4L2M2MDevice::get_control(uint32_t id) const {
+int32_t V4L2M2MDevice::get_control(uint32_t id) const
+{
     v4l2_control ctrl = {
         .id = id,
     };

@@ -81,9 +81,17 @@ public:
     void set_ext_controls(int request_fd, std::span<v4l2_ext_control> controls);
     void set_streaming(bool enable);
 
+    /* Mode detection (VPU_DESIGN.md 7.6 point 1): a decoder whose coded
+     * OUTPUT formats carry V4L2_FMT_FLAG_DYN_RESOLUTION and include no
+     * _SLICE/_FRAME format is stateful (full-bitstream); it needs no media
+     * node and no Request API. */
+    bool stateful_decoder() const;
+
     int video_fd;
     int media_fd;
     const uint32_t capabilities;
+    /* V4L2_BUF_CAP_* from the last VIDIOC_REQBUFS; guards VIDIOC_EXPBUF. */
+    uint32_t buffer_capabilities = 0;
     const v4l2_buf_type capture_buf_type;
     const v4l2_buf_type output_buf_type;
     v4l2_format capture_format;
