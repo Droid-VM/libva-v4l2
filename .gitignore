@@ -43,3 +43,6 @@ config.sub
 configure
 depcomp
 TAGS
+
+# build-packages.sh writes the guest .deb into the repo root; dist-guest/ in the meta repo is the home for it
+*.deb
