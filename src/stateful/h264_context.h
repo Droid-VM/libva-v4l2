@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -95,6 +96,15 @@ public:
     };
     std::optional<FrameView> frame_view(const Surface& surface);
 
+    /* vaDeriveImage returned VA_STATUS_ERROR_OPERATION_FAILED: explain why,
+     * exactly once per context (7.7 (4)). GStreamer's va plugin probes derive
+     * at NEGOTIATION time, before any decode, so the surface is not yet bound
+     * to a decoded frame and derive cannot map one; the plugin then negotiates
+     * system memory and copies through vaGetImage (B19: 300/300). have_view is
+     * false when no frame is bound (the negotiation case), true when a frame is
+     * bound but is not a single contiguous NV12 plane. */
+    void note_derive_unavailable(VADriverContextP va_context, bool have_view);
+
     /* Serialise a reader of decoded frame memory (vaGetImage/vaDeriveImage)
      * against CAPTURE re-provisioning (D83). Do not take the driver-wide
      * mutex while holding this (lock order: driver mutex, then session). */
@@ -114,4 +124,6 @@ private:
     mutable std::mutex builder_mutex_;
     mutable stateful::H264AccessUnitBuilder au_builder_;
     uint64_t next_sequence_ = 1;
+    /* 7.7 (4): the derive-unavailable reason is logged once per context. */
+    std::atomic<bool> derive_unavailable_logged_ { false };
 };

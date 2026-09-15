@@ -279,6 +279,22 @@ std::optional<StatefulH264Context::FrameView> StatefulH264Context::frame_view(co
     return view;
 }
 
+void StatefulH264Context::note_derive_unavailable(VADriverContextP va_context, bool have_view)
+{
+    if (derive_unavailable_logged_.exchange(true)) {
+        return;
+    }
+    const bool gbm = session_.capture_mode() == stateful::StatefulSession::CaptureMode::gbm_dmabuf;
+    /* The case that actually fires on the phone (num_planes == 1, B21-accept
+     * §5.4) is have_view == false: a derive probe on a surface with no decoded
+     * frame. GStreamer then negotiates system memory and copies through
+     * vaGetImage (use derived: false) -- the B19-proven 300/300 path, in either
+     * mode. Derive succeeds once the surface carries a synced frame. */
+    info_log(va_context,
+        "vaDeriveImage: %s (%s mode) -- returning OPERATION_FAILED; the client copies via vaGetImage\n",
+        stateful::derive_unavailable_message(have_view), gbm ? "gbm-dmabuf" : "mmap");
+}
+
 VAStatus StatefulH264Context::export_surface(
     VADriverContextP va_context, Surface& surface, uint32_t flags, void* descriptor)
 {

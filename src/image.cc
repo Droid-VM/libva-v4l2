@@ -242,6 +242,12 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
         auto frames_guard = surface.stateful_context->hold_frames();
         auto view = surface.stateful_context->frame_view(surface);
         if (!view || view->contiguous.empty()) {
+            /* 7.7 (4): explain the OPERATION_FAILED once. The frames guard does
+             * not take the driver mutex, and the log helpers do not either, so
+             * this is safe to call while holding it. */
+            const bool have_view = view.has_value();
+            frames_guard.unlock();
+            surface.stateful_context->note_derive_unavailable(context, have_view);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
 

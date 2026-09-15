@@ -80,6 +80,21 @@ inline ExportGate export_gate(bool session_dead, bool has_decoded_frame, bool gb
 }
 
 /*
+ * Why vaDeriveImage returned VA_STATUS_ERROR_OPERATION_FAILED (7.7 (4)), pure
+ * so the message selection is host-testable. have_view is false when the
+ * surface has no decoded frame bound (a negotiation-time derive probe, the
+ * case that fires on the phone: num_planes == 1, B21-accept §5.4), true when a
+ * frame is bound but is not a single contiguous NV12 plane. In both cases the
+ * client copies through vaGetImage (GStreamer's 'use derived: false' -- B19's
+ * 300/300 path).
+ */
+inline const char* derive_unavailable_message(bool have_view)
+{
+    return have_view ? "the decoded frame is not a single contiguous NV12 plane"
+                     : "no decoded frame is bound to this surface yet";
+}
+
+/*
  * Fill an NV12/LINEAR descriptor for a single dma-buf object (7.7 point 3).
  * Composed layers (Firefox's GetVAAPISurfaceDescriptor, B19): one NV12 layer,
  * two planes in the one object -- luma at offset 0, chroma at stride*height.

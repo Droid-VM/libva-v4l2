@@ -413,6 +413,20 @@ void test_export_gate()
     CHECK(export_gate(true, true, true, true) == ExportGate::dead);
 }
 
+/* --- vaDeriveImage unavailable reason (7.7 (4)), pure --- */
+
+void test_derive_unavailable_message()
+{
+    using stateful::derive_unavailable_message;
+    /* No frame bound (the negotiation-time probe, the phone's num_planes == 1
+     * case): the message names the unbound surface. Named mutation: swap the
+     * have_view branch -> the two messages cross. */
+    CHECK(std::string(derive_unavailable_message(false)) == "no decoded frame is bound to this surface yet");
+    /* A frame is bound but not a single contiguous plane. */
+    CHECK(std::string(derive_unavailable_message(true)) == "the decoded frame is not a single contiguous NV12 plane");
+    CHECK(std::string(derive_unavailable_message(false)) != std::string(derive_unavailable_message(true)));
+}
+
 /* --- MMAP mode still works (7.7 point 6: keep VA1 behaviour) --- */
 
 void test_mmap_mode_unaffected()
@@ -451,6 +465,7 @@ int main()
     test_prime_descriptor_composed();
     test_prime_descriptor_separate();
     test_export_gate();
+    test_derive_unavailable_message();
     test_mmap_mode_unaffected();
     return check_result("test_gbm_surface");
 }
