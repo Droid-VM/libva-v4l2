@@ -35,10 +35,17 @@ extern "C" {
 
 namespace {
 
-stateful::StatefulSession::Options session_options(std::span<VASurfaceID> surface_ids)
+stateful::StatefulSession::Options session_options(DriverData* driver_data, std::span<VASurfaceID> surface_ids)
 {
     stateful::StatefulSession::Options options;
     options.num_surfaces = surface_ids.size();
+    /* D84: modern clients pass no render targets to vaCreateContext (the
+     * B18 strace showed the pool provisioned at the bare device minimum),
+     * so the share is sized from the surfaces that actually exist when the
+     * first SOURCE_CHANGE provisions the pool. The counter is atomic
+     * because this runs under the session mutex, which must never take the
+     * driver-wide mutex. */
+    options.surface_count = [driver_data] { return driver_data->surface_count.load(std::memory_order_relaxed); };
     return options;
 }
 
@@ -58,7 +65,7 @@ StatefulH264Context::StatefulH264Context(DriverData* driver_data, V4L2M2MDevice&
     : Context(driver_data, device, picture_width, picture_height)
     , profile_(profile)
     , device_io_(device)
-    , session_(device_io_, V4L2_PIX_FMT_H264, picture_width, picture_height, session_options(surface_ids))
+    , session_(device_io_, V4L2_PIX_FMT_H264, picture_width, picture_height, session_options(driver_data, surface_ids))
     , au_builder_(profile)
 {
 }

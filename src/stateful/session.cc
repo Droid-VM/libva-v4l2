@@ -78,6 +78,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     : device_(device)
     , log_(std::move(log))
     , num_surfaces_(options.num_surfaces)
+    , surface_count_(options.surface_count)
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , output_pixelformat_(coded_pixelformat)
@@ -183,17 +184,30 @@ void StatefulSession::handle_source_change_locked()
     }
 
     /* 7.6 point 4: pool size = MIN_BUFFERS_FOR_CAPTURE + min(num_surfaces, 8),
-     * capped at 32; geometry from G_FMT(CAPTURE). */
+     * capped at 32; geometry from G_FMT(CAPTURE). D84: num_surfaces from
+     * vaCreateContext is 0 with modern clients, so re-read the live surface
+     * count here -- provisioning happens at the first SOURCE_CHANGE, by
+     * which time vaCreateSurfaces has made the pool. Without the share the
+     * client's held surfaces come out of the codec's own slots and the
+     * session deadlocks the way mpv did in B18. */
+    if (surface_count_) {
+        num_surfaces_ = std::max(num_surfaces_, surface_count_());
+    }
     capture_format_ = device_.capture_format();
     const unsigned min_buffers = std::max(device_.min_buffers_for_capture(), 1);
-    unsigned count = min_buffers + std::min(num_surfaces_, kPoolShareCap);
-    count = std::min(count, kMaxCaptureBuffers);
+    const unsigned share = std::min(num_surfaces_, kPoolShareCap);
+    unsigned count = std::min(min_buffers + share, kMaxCaptureBuffers);
 
     capture_count_ = device_.request_capture_buffers(count);
     if (capture_count_ == 0) {
         throw std::runtime_error("no CAPTURE buffers granted");
     }
     generation_ += 1; /* D83: every binding handed out before this is stale */
+
+    char line[128];
+    snprintf(line, sizeof(line), "CAPTURE pool: min %u + share %u = %u (surfaces %u, granted %u)", min_buffers, share,
+        count, num_surfaces_, capture_count_);
+    log(line);
     for (unsigned i = 0; i < capture_count_; i++) {
         device_.queue_capture(i);
     }

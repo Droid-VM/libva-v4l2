@@ -57,6 +57,14 @@ class StatefulSession {
 public:
     struct Options {
         unsigned num_surfaces = 0;
+        /* D84: the live surface count, re-read at every CAPTURE
+         * provisioning; the larger of it and num_surfaces sets the pool
+         * share. vaCreateContext's render-target list is empty in modern
+         * clients (ffmpeg passes none), so the count must come from the
+         * surfaces vaCreateSurfaces actually made. Called with the session
+         * mutex held: it must not take the driver-wide mutex (read an
+         * atomic counter instead). */
+        std::function<unsigned()> surface_count;
         unsigned output_ring_size = 8;
         /* < 0: LIBVA_V4L2_SYNC_TIMEOUT_MS or the 500 ms default (point 5b). */
         int sync_timeout_ms = -1;
@@ -138,6 +146,7 @@ private:
     StatefulDevice& device_;
     std::function<void(const char*)> log_;
     unsigned num_surfaces_;
+    std::function<unsigned()> surface_count_;
     unsigned output_ring_size_;
     int sync_timeout_ms_;
     uint32_t output_pixelformat_;

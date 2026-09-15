@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,10 @@ struct DriverData {
     std::map<VAConfigID, Config> configs;
     std::map<VAContextID, std::unique_ptr<Context>> contexts;
     std::map<VASurfaceID, Surface> surfaces;
+    /* Mirrors surfaces.size(); readable without the mutex (D84: the
+     * stateful session sizes its CAPTURE pool share from it while holding
+     * its own lock, and the lock order forbids taking this mutex there). */
+    std::atomic<unsigned> surface_count { 0 };
     std::map<VABufferID, Buffer> buffers;
     std::map<VAImageID, VAImage> images;
     std::vector<V4L2M2MDevice> devices;

@@ -86,6 +86,8 @@ VAStatus createSurfaces2(VADriverContextP context, unsigned int format, unsigned
         if (!inserted) {
             return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
+        driver_data->surface_count.store(
+            static_cast<unsigned>(driver_data->surfaces.size()), std::memory_order_relaxed);
     }
 
     return VA_STATUS_SUCCESS;
@@ -153,6 +155,8 @@ VAStatus destroySurfaces(VADriverContextP context, VASurfaceID* surfaces_ids, in
             close(surface.request_fd);
 
         driver_data->surfaces.erase(surfaces_ids[i]);
+        driver_data->surface_count.store(
+            static_cast<unsigned>(driver_data->surfaces.size()), std::memory_order_relaxed);
     }
 
     return VA_STATUS_SUCCESS;

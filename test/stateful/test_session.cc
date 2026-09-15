@@ -29,6 +29,7 @@
  * delivery, the timeout drain, OUTPUT ring growth, and the dead session.
  */
 
+#include <string>
 #include <vector>
 
 #include "../../src/stateful/session.h"
@@ -175,6 +176,61 @@ void test_timeout_drain_recovery()
     CHECK_EQ(session.timeout_recoveries(), 2u);
 }
 
+void test_capture_pool_share()
+{
+    /* D84: the B18 strace showed REQBUFS(CAPTURE) = the announced minimum
+     * (21) because vaCreateContext carried no render targets, so the
+     * client's held surfaces came out of the codec's own slots. The pool
+     * must be min + min(surfaces, 8) capped at 32 (7.6 point 4), with the
+     * surface count read live at provisioning time. Named mutation this
+     * fails under: drop the surface_count re-read in handle_source_change
+     * (num_surfaces stays 0 and the ask collapses to the bare minimum). */
+    auto decode_one = [](FakeDevice& device, StatefulSession& session) {
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+        session.release_frame(frame);
+    };
+
+    {
+        std::vector<std::string> lines;
+        FakeDevice device;
+        device.scripted_min_buffers = 21;
+        StatefulSession::Options options = fast_options();
+        options.num_surfaces = 0; /* what vaCreateContext really passes */
+        options.surface_count = [] { return 12u; };
+        StatefulSession session(
+            device, 0x34363248, 1920, 1088, options, [&lines](const char* m) { lines.emplace_back(m); });
+        decode_one(device, session);
+        CHECK_EQ(device.capture_count, 29u); /* 21 + min(12, 8) */
+        bool logged = false;
+        for (auto&& line : lines) {
+            logged = logged || line.find("CAPTURE pool: min 21 + share 8 = 29 (surfaces 12") != std::string::npos;
+        }
+        CHECK(logged);
+    }
+    {
+        FakeDevice device;
+        device.scripted_min_buffers = 21;
+        StatefulSession::Options options = fast_options();
+        options.num_surfaces = 0;
+        options.surface_count = [] { return 4u; };
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        decode_one(device, session);
+        CHECK_EQ(device.capture_count, 25u); /* 21 + min(4, 8) */
+    }
+    {
+        FakeDevice device;
+        device.scripted_min_buffers = 30;
+        StatefulSession::Options options = fast_options();
+        options.num_surfaces = 0;
+        options.surface_count = [] { return 12u; };
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        decode_one(device, session);
+        CHECK_EQ(device.capture_count, 32u); /* 30 + 8 capped at 32 */
+    }
+}
+
 void test_stale_release_after_reprovision()
 {
     FakeDevice device;
@@ -305,6 +361,7 @@ int main()
     test_provisioning_and_mapping();
     test_out_of_order_delivery_and_stash();
     test_drop_sequence_recycles();
+    test_capture_pool_share();
     test_stale_release_after_reprovision();
     test_timeout_drain_recovery();
     test_output_ring_growth();
