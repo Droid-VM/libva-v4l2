@@ -52,26 +52,36 @@ VAStatus beginPicture(VADriverContextP va_context, VAContextID context_id, VASur
 {
     auto driver_data = static_cast<DriverData*>(va_context->pDriverData);
 
-    if (!driver_data->contexts.contains(context_id)) {
-        return VA_STATUS_ERROR_INVALID_CONTEXT;
-    }
-    auto& context = *driver_data->contexts.at(context_id);
+    /* D83: resolve context and surface under the shared lock; a concurrent
+     * vaCreateBuffer/vaDestroyBuffer on another frame thread must not race
+     * the lookups. Release the lock before touching the session. */
+    Context* context;
+    Surface* surface;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto context_it = driver_data->contexts.find(context_id);
+        if (context_it == driver_data->contexts.end()) {
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        context = context_it->second.get();
 
-    if (!driver_data->surfaces.contains(surface_id)) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
-    auto& surface = driver_data->surfaces.at(surface_id);
+        auto surface_it = driver_data->surfaces.find(surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface = &surface_it->second;
 
-    if (surface.status == VASurfaceRendering) {
-        return VA_STATUS_ERROR_SURFACE_BUSY;
+        if (surface->status == VASurfaceRendering) {
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
     }
 
     /* Stateful path: a reused surface re-queues its CAPTURE buffer
      * (VPU_DESIGN.md 7.6 point 4). */
-    context.stateful_begin_picture(surface);
+    context->stateful_begin_picture(*surface);
 
-    surface.status = VASurfaceRendering;
-    context.render_surface_id = surface_id;
+    surface->status = VASurfaceRendering;
+    context->render_surface_id = surface_id;
 
     return VA_STATUS_SUCCESS;
 }
@@ -82,20 +92,29 @@ VAStatus renderPicture(VADriverContextP va_context, VAContextID context_id, VABu
     int rc;
     int i;
 
-    if (!driver_data->contexts.contains(context_id)) {
+    /* D83: store_buffer copies the buffer's bytes immediately (no device
+     * wait), so the shared lock is held for the whole call -- it is what keeps
+     * the buffers map stable against the vaCreateBuffer/vaDestroyBuffer the
+     * client interleaves. (Named mutation the threads test fails under: drop
+     * this lock -- TSan reports the map race.) */
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+
+    auto context_it = driver_data->contexts.find(context_id);
+    if (context_it == driver_data->contexts.end()) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
-    const auto& context = *driver_data->contexts.at(context_id);
+    const auto& context = *context_it->second;
 
     if (!driver_data->surfaces.contains(context.render_surface_id)) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     for (i = 0; i < buffers_count; i++) {
-        if (!driver_data->buffers.contains(buffers_ids[i])) {
+        auto buffer_it = driver_data->buffers.find(buffers_ids[i]);
+        if (buffer_it == driver_data->buffers.end()) {
             return VA_STATUS_ERROR_INVALID_BUFFER;
         }
 
-        rc = context.store_buffer(driver_data->buffers.at(buffers_ids[i]));
+        rc = context.store_buffer(buffer_it->second);
         if (rc != VA_STATUS_SUCCESS)
             return rc;
     }
@@ -108,14 +127,26 @@ VAStatus endPicture(VADriverContextP va_context, VAContextID context_id)
     auto driver_data = static_cast<DriverData*>(va_context->pDriverData);
     VAStatus status;
 
-    if (!driver_data->contexts.contains(context_id)) {
-        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    /* D83: resolve refs under the shared lock, then release it before the
+     * session submit (which waits on the device) or the stateless queue path
+     * (which does its own I/O). */
+    Context* context_ptr;
+    Surface* surface_ptr;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto context_it = driver_data->contexts.find(context_id);
+        if (context_it == driver_data->contexts.end()) {
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        context_ptr = context_it->second.get();
+        auto surface_it = driver_data->surfaces.find(context_ptr->render_surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface_ptr = &surface_it->second;
     }
-    auto& context = *driver_data->contexts.at(context_id);
-    if (!driver_data->surfaces.contains(context.render_surface_id)) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
-    auto& surface = driver_data->surfaces.at(context.render_surface_id);
+    auto& context = *context_ptr;
+    auto& surface = *surface_ptr;
 
     if (context.is_stateful()) {
         /* One access unit per vaEndPicture into one OUTPUT buffer

@@ -128,6 +128,25 @@ test_session_threads = executable('test_stateful_session_threads',
 	dependencies: [ kernel_dep, thread_dep ])
 test('stateful-session-threads', test_session_threads)
 
+# D83: the driver-wide id->object maps read on the hot path while another
+# frame thread inserts/erases (vaCreateBuffer/vaDestroyBuffer per picture).
+# This links the whole backend and drives the real vtable entry points from
+# two threads; run it under -fsanitize=thread (a dedicated sanitizer build
+# dir) to catch the map race the shared_mutex closes.
+test_driver_maps = executable('test_driver_maps',
+	[ '../test/stateful/test_driver_maps.cc', sources, headers ],
+	cpp_args: cpp_args,
+	dependencies: [
+		libva_dep,
+		libdrm_dep,
+		libgstcodecparsers_dep,
+		libgstcodecs_dep,
+		libudev_dep,
+		kernel_dep,
+		thread_dep,
+	])
+test('driver-maps', test_driver_maps)
+
 dl_dep = cc.find_library('dl', required: false)
 
 test_probe = executable('test_driver_probe',

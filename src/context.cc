@@ -151,10 +151,19 @@ VAStatus createContext(VADriverContextP va_context, VAConfigID config_id, int pi
     // FIXME: Should create own V4L2M2MDevice to localize settings?
     auto driver_data = static_cast<DriverData*>(va_context->pDriverData);
 
-    if (!driver_data->configs.contains(config_id)) {
+    /* D83: hold the map lock exclusively across validation and insert -- and
+     * across Context::create, which for the stateful path provisions the
+     * session (device I/O, possibly the EBUSY retry). createContext runs once
+     * before any decode thread, so blocking other VA calls here is free; the
+     * config/surface reads must not race a concurrent destroyConfig/
+     * destroySurfaces. */
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
+
+    auto config_it = driver_data->configs.find(config_id);
+    if (config_it == driver_data->configs.end()) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
-    const auto& config = driver_data->configs.at(config_id);
+    const auto& config = config_it->second;
 
     auto surfaces = std::span(surface_ids, surfaces_count);
     for (auto&& surface : surfaces) {
@@ -163,7 +172,6 @@ VAStatus createContext(VADriverContextP va_context, VAConfigID config_id, int pi
         }
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
     try {
         *context_id = smallest_free_key(driver_data->contexts);
         auto [context, inserted] = driver_data->contexts.emplace(std::make_pair(
@@ -184,7 +192,7 @@ VAStatus destroyContext(VADriverContextP va_context, VAContextID context_id)
 {
     auto driver_data = static_cast<DriverData*>(va_context->pDriverData);
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     if (!driver_data->contexts.contains(context_id)) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }

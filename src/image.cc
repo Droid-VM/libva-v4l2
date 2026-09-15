@@ -50,12 +50,20 @@ namespace {
  * claimed CAPTURE buffer's mmap, honouring the G_FMT stride. */
 VAStatus copy_stateful_surface_to_image(DriverData* driver_data, const Surface& surface, VAImage* image)
 {
-    if (!driver_data->buffers.contains(image->buf)) {
-        return VA_STATUS_ERROR_INVALID_BUFFER;
+    /* D83: resolve the destination buffer under the shared lock, then release
+     * it before taking the session's hold() (lock order: driver -> session).
+     * The image's own buffer is not destroyed while its getImage runs. */
+    uint8_t* dest;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto buffer_it = driver_data->buffers.find(image->buf);
+        if (buffer_it == driver_data->buffers.end()) {
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+        dest = buffer_it->second.map();
     }
-    auto& buffer = driver_data->buffers.at(image->buf);
 
-    /* D83: hold the session while reading the CAPTURE mmap so a concurrent
+    /* Hold the session while reading the CAPTURE mmap so a concurrent
      * re-provision cannot unmap it mid-copy. */
     auto frames_guard = surface.stateful_context->hold_frames();
     auto view = surface.stateful_context->frame_view(surface);
@@ -71,13 +79,13 @@ VAStatus copy_stateful_surface_to_image(DriverData* driver_data, const Surface& 
     const unsigned row_bytes = std::min<unsigned>(image->pitches[0], view->pitch);
     for (unsigned row = 0; row < luma_rows; row++) {
         std::copy_n(view->luma.data() + static_cast<size_t>(row) * view->pitch, row_bytes,
-            buffer.map() + image->offsets[0] + static_cast<size_t>(row) * image->pitches[0]);
+            dest + image->offsets[0] + static_cast<size_t>(row) * image->pitches[0]);
     }
     const unsigned chroma_rows = std::min<unsigned>((image->height + 1) / 2, view->coded_height / 2);
     const unsigned chroma_bytes = std::min<unsigned>(image->pitches[1], view->pitch);
     for (unsigned row = 0; row < chroma_rows; row++) {
         std::copy_n(view->chroma.data() + static_cast<size_t>(row) * view->pitch, chroma_bytes,
-            buffer.map() + image->offsets[1] + static_cast<size_t>(row) * image->pitches[1]);
+            dest + image->offsets[1] + static_cast<size_t>(row) * image->pitches[1]);
     }
 
     return VA_STATUS_SUCCESS;
@@ -91,10 +99,15 @@ VAStatus copy_surface_to_image(DriverData* driver_data, const Surface& surface, 
         return copy_stateful_surface_to_image(driver_data, surface, image);
     }
 
-    if (!driver_data->buffers.contains(image->buf)) {
-        return VA_STATUS_ERROR_INVALID_BUFFER;
+    uint8_t* dest_base;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto buffer_it = driver_data->buffers.find(image->buf);
+        if (buffer_it == driver_data->buffers.end()) {
+            return VA_STATUS_ERROR_INVALID_BUFFER;
+        }
+        dest_base = buffer_it->second.data.get();
     }
-    auto& buffer = driver_data->buffers.at(image->buf);
 
     assert(image->num_planes == surface.logical_destination_layout.size());
     for (i = 0; i < surface.logical_destination_layout.size(); i++) {
@@ -102,7 +115,7 @@ VAStatus copy_surface_to_image(DriverData* driver_data, const Surface& surface, 
 
         const auto source = mapping[surface.logical_destination_layout[i].physical_plane_index].data()
             + surface.logical_destination_layout[i].offset;
-        const auto dest = buffer.data.get() + image->offsets[i];
+        const auto dest = dest_base + image->offsets[i];
 
         // Image planes may be smaller than buffer due to decoding blocks
         const auto size
@@ -151,7 +164,7 @@ VAStatus createImage(VADriverContextP context, VAImageFormat* format, int width,
         return status;
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     image->image_id = smallest_free_key(driver_data->images);
     auto [image_it, inserted] = driver_data->images.emplace(std::make_pair(image->image_id, *image));
     if (!inserted) {
@@ -165,17 +178,25 @@ VAStatus destroyImage(VADriverContextP context, VAImageID image_id)
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->images.contains(image_id)) {
-        return VA_STATUS_ERROR_INVALID_IMAGE;
+    /* D83: read the image's buffer id under the shared lock, then drop it --
+     * destroyBuffer takes the lock exclusively itself, and the final erase
+     * retakes it. */
+    VABufferID buf;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto image_it = driver_data->images.find(image_id);
+        if (image_it == driver_data->images.end()) {
+            return VA_STATUS_ERROR_INVALID_IMAGE;
+        }
+        buf = image_it->second.buf;
     }
-    auto& image = driver_data->images.at(image_id);
 
-    VAStatus status = destroyBuffer(context, image.buf);
+    VAStatus status = destroyBuffer(context, buf);
     if (status != VA_STATUS_SUCCESS) {
         return status;
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     if (!driver_data->images.erase(image_id)) {
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
@@ -189,14 +210,30 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
     VAImageFormat format;
     VAStatus status;
 
-    if (!driver_data->surfaces.contains(surface_id)) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
+    /* D83: resolve the surface under the shared lock, then drop it before
+     * syncSurface (which waits on the device and takes the lock itself). The
+     * surface reference stays valid across the release. */
+    Surface* surface_ptr;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto surface_it = driver_data->surfaces.find(surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface_ptr = &surface_it->second;
     }
-    auto& surface = driver_data->surfaces.at(surface_id);
+    auto& surface = *surface_ptr;
 
     if (surface.stateful_context != nullptr) {
         /* 7.6 point 4: map the claimed CAPTURE buffer's NV12 mmap directly,
-         * with the G_FMT stride. */
+         * with the G_FMT stride. This is a single-buffer view: it works only
+         * when the device presents NV12 as one contiguous CAPTURE plane
+         * (num_planes == 1, so frame_view fills contiguous). A device that
+         * reports two memory planes (separate luma/chroma mmaps) has no single
+         * buffer to derive, so this returns OPERATION_FAILED and the client
+         * copies through vaCreateImage + vaGetImage instead (GStreamer's va
+         * plugin logs 'use derived: false' and does exactly that -- 300/300 in
+         * B19-browser); getImage's copy path handles both plane counts. */
         if (surface.status == VASurfaceRendering) {
             status = syncSurface(context, surface_id);
             if (status != VA_STATUS_SUCCESS)
@@ -225,7 +262,7 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
          * the image buffer is inherent to vaDeriveImage. */
         frames_guard.unlock();
 
-        std::lock_guard<std::mutex> guard(driver_data->mutex);
+        std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
         VABufferID buffer_id = smallest_free_key(driver_data->buffers);
         driver_data->buffers.emplace(std::make_pair(
             buffer_id, Buffer(VAImageBufferType, 1, image->data_size, surface_id, view->contiguous.data())));
@@ -265,10 +302,12 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
 
     surface.status = VASurfaceReady;
 
-    if (!driver_data->buffers.contains(image->buf)) {
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
+    auto buffer_it = driver_data->buffers.find(image->buf);
+    if (buffer_it == driver_data->buffers.end()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
-    driver_data->buffers.at(image->buf).derived_surface_id = surface_id;
+    buffer_it->second.derived_surface_id = surface_id;
 
     return VA_STATUS_SUCCESS;
 }
@@ -291,19 +330,32 @@ VAStatus getImage(VADriverContextP context, VASurfaceID surface_id, int x, int y
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->surfaces.contains(surface_id)) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
-    }
+    /* D83: resolve the surface reference and a copy of the image descriptor
+     * under the shared lock, then release it before the copy. The copy only
+     * writes into the image's own buffer memory (re-resolved under the lock in
+     * copy_surface_to_image), never the maps; neither the surface nor the
+     * image is destroyed by the client mid-getImage. */
+    Surface* surface_ptr;
+    VAImage image;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto surface_it = driver_data->surfaces.find(surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface_ptr = &surface_it->second;
 
-    if (!driver_data->images.contains(image_id)) {
-        return VA_STATUS_ERROR_INVALID_IMAGE;
+        auto image_it = driver_data->images.find(image_id);
+        if (image_it == driver_data->images.end()) {
+            return VA_STATUS_ERROR_INVALID_IMAGE;
+        }
+        image = image_it->second;
     }
-    auto& image = driver_data->images.at(image_id);
 
     if (x != 0 || y != 0 || width != image.width || height != image.height)
         return VA_STATUS_ERROR_UNIMPLEMENTED;
 
-    return copy_surface_to_image(driver_data, driver_data->surfaces.at(surface_id), &image);
+    return copy_surface_to_image(driver_data, *surface_ptr, &image);
 }
 
 VAStatus putImage(VADriverContextP context, VASurfaceID surface_id, VAImageID image, int src_x, int src_y,

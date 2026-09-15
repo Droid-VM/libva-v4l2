@@ -77,7 +77,7 @@ VAStatus createSurfaces2(VADriverContextP context, unsigned int format, unsigned
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     for (unsigned i = 0; i < surfaces_count; i++) {
         surfaces_ids[i] = smallest_free_key(driver_data->surfaces);
         auto [config, inserted] = driver_data->surfaces.emplace(std::make_pair(surfaces_ids[i],
@@ -139,12 +139,24 @@ VAStatus destroySurfaces(VADriverContextP context, VASurfaceID* surfaces_ids, in
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     for (int i = 0; i < surfaces_count; i++) {
-        if (!driver_data->surfaces.contains(surfaces_ids[i])) {
+        auto surface_it = driver_data->surfaces.find(surfaces_ids[i]);
+        if (surface_it == driver_data->surfaces.end()) {
             return VA_STATUS_ERROR_INVALID_SURFACE;
         }
-        auto& surface = driver_data->surfaces.at(surfaces_ids[i]);
+        auto& surface = surface_it->second;
+
+        if (surface.status == VASurfaceRendering) {
+            /* D83: an in-flight surface (submitted, its sync not yet done) may
+             * be resolved-then-used by a concurrent vaSyncSurface/vaDeriveImage
+             * that dropped the driver lock. Refusing to erase it keeps that
+             * resolved reference valid. Clients that flush drop surfaces only
+             * after syncing them (VASurfaceDisplaying/Ready); the context
+             * teardown resets status to Ready before surfaces are destroyed,
+             * so this never blocks a clean close. */
+            return VA_STATUS_ERROR_SURFACE_BUSY;
+        }
 
         if (surface.stateful_context != nullptr) {
             /* Re-queue the surface's CAPTURE buffer (7.6 point 4). */
@@ -166,10 +178,21 @@ VAStatus syncSurface(VADriverContextP context, VASurfaceID surface_id)
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->surfaces.contains(surface_id)) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
+    /* D83: resolve under the shared lock, release it before the session sync
+     * -- sync() waits on the device and the lock order forbids holding the
+     * driver lock across that wait. The surface reference stays valid: ffmpeg
+     * never destroys a surface it is syncing, and destroySurfaces refuses to
+     * erase a VASurfaceRendering one. */
+    Surface* surface_ptr;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto surface_it = driver_data->surfaces.find(surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface_ptr = &surface_it->second;
     }
-    auto& surface = driver_data->surfaces.at(surface_id);
+    auto& surface = *surface_ptr;
 
     if (surface.stateful_context != nullptr) {
         return surface.stateful_context->sync_surface(context, surface);
@@ -258,10 +281,12 @@ VAStatus querySurfaceStatus(VADriverContextP context, VASurfaceID surface_id, VA
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->surfaces.contains(surface_id)) {
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+    auto surface_it = driver_data->surfaces.find(surface_id);
+    if (surface_it == driver_data->surfaces.end()) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    *status = driver_data->surfaces.at(surface_id).status;
+    *status = surface_it->second.status;
 
     return VA_STATUS_SUCCESS;
 }
@@ -295,10 +320,12 @@ VAStatus exportSurfaceHandle(
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
-    if (!driver_data->surfaces.contains(surface_id)) {
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+    auto surface_it = driver_data->surfaces.find(surface_id);
+    if (surface_it == driver_data->surfaces.end()) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    const auto& surface = driver_data->surfaces.at(surface_id);
+    const auto& surface = surface_it->second;
 
     if (surface.stateful_context != nullptr) {
         /* VA1 has no zero-copy path (7.6 point 7): the virtio-media device

@@ -61,7 +61,7 @@ VAStatus createConfig(VADriverContextP context, VAProfile profile, VAEntrypoint 
         attributes_count = Config::max_attributes;
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     *config_id = smallest_free_key(driver_data->configs);
     auto [config, inserted] = driver_data->configs.emplace(std::make_pair(*config_id,
         Config {
@@ -87,7 +87,7 @@ VAStatus destroyConfig(VADriverContextP context, VAConfigID config_id)
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     if (!driver_data->configs.erase(config_id)) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
@@ -129,10 +129,12 @@ VAStatus queryConfigAttributes(VADriverContextP context, VAConfigID config_id, V
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->configs.contains(config_id)) {
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+    auto config_it = driver_data->configs.find(config_id);
+    if (config_it == driver_data->configs.end()) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
-    const auto& config = driver_data->configs.at(config_id);
+    const auto& config = config_it->second;
 
     if (profile != NULL)
         *profile = config.profile;

@@ -88,7 +88,7 @@ VAStatus createBuffer(VADriverContextP context, VAContextID context_id, VABuffer
         return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
     }
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     *buffer_id = smallest_free_key(driver_data->buffers);
     auto [buffer, inserted] = driver_data->buffers.emplace(std::make_pair(*buffer_id, Buffer(type, count, size)));
     if (!inserted || !buffer->second.data) {
@@ -106,7 +106,7 @@ VAStatus destroyBuffer(VADriverContextP context, VABufferID buffer_id)
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    std::lock_guard<std::mutex> guard(driver_data->mutex);
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
     auto buffer_it = driver_data->buffers.find(buffer_id);
     if (buffer_it == driver_data->buffers.end()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -120,12 +120,16 @@ VAStatus mapBuffer(VADriverContextP context, VABufferID buffer_id, void** data_m
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->buffers.contains(buffer_id)) {
+    /* D83: resolve under the shared lock so vaCreateBuffer/vaDestroyBuffer on
+     * another frame thread cannot mutate the map between find and use. */
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+    auto buffer_it = driver_data->buffers.find(buffer_id);
+    if (buffer_it == driver_data->buffers.end()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 
     /* Our buffers are always mapped. */
-    *data_map = driver_data->buffers.at(buffer_id).map();
+    *data_map = buffer_it->second.map();
 
     return VA_STATUS_SUCCESS;
 }
@@ -135,6 +139,7 @@ VAStatus unmapBuffer(VADriverContextP context, VABufferID buffer_id)
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
     /* Our buffers are always mapped. */
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
     if (!driver_data->buffers.contains(buffer_id)) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
@@ -146,10 +151,14 @@ VAStatus bufferSetNumElements(VADriverContextP context, VABufferID buffer_id, un
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->buffers.contains(buffer_id)) {
+    /* Exclusive: this reallocates the buffer's storage, a value mutation, so
+     * no concurrent reader may hold a pointer into it. */
+    std::lock_guard<std::shared_mutex> guard(driver_data->mutex);
+    auto buffer_it = driver_data->buffers.find(buffer_id);
+    if (buffer_it == driver_data->buffers.end()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
-    auto& buffer = driver_data->buffers.at(buffer_id);
+    auto& buffer = buffer_it->second;
 
     buffer.data.reset(static_cast<uint8_t*>(reallocarray(buffer.data.release(), buffer.size, count)));
     buffer.count = count;
@@ -162,10 +171,12 @@ VAStatus bufferInfo(
 {
     auto driver_data = static_cast<DriverData*>(context->pDriverData);
 
-    if (!driver_data->buffers.contains(buffer_id)) {
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+    auto buffer_it = driver_data->buffers.find(buffer_id);
+    if (buffer_it == driver_data->buffers.end()) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
-    auto& buffer = driver_data->buffers.at(buffer_id);
+    auto& buffer = buffer_it->second;
 
     *type = buffer.type;
     *size = buffer.size;

@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 extern "C" {
 #include <linux/videodev2.h>
@@ -68,7 +69,32 @@ struct DriverData {
     std::map<VABufferID, Buffer> buffers;
     std::map<VAImageID, VAImage> images;
     std::vector<V4L2M2MDevice> devices;
-    std::mutex mutex;
+    /*
+     * D83: the id->object maps above are read on the hot decode path
+     * (vaBeginPicture/vaRenderPicture/vaEndPicture/vaSyncSurface/vaDeriveImage/
+     * vaGetImage/vaMapBuffer) while another ffmpeg frame thread mutates them
+     * (vaCreateBuffer/vaDestroyBuffer run per picture; ffmpeg's vaapi hwaccel
+     * is HWACCEL_CAP_ASYNC_SAFE, so the overlap is real). B18/B19 caught the
+     * lock-free 'contains() then .at()' racing a concurrent insert/erase and
+     * aborting with std::out_of_range 'map::at'. This is now a shared_mutex:
+     * readers take it SHARED (std::shared_lock), create/destroy take it
+     * EXCLUSIVE (std::lock_guard/std::unique_lock). Rules a reader must keep:
+     *   - resolve the id to a reference/pointer under the lock, then RELEASE
+     *     the lock before any long operation (a StatefulSession sync/submit
+     *     that waits on the device). std::map nodes stay valid across
+     *     inserts/erases of OTHER keys, and ffmpeg never destroys a
+     *     surface/buffer that is still in flight, so the resolved reference
+     *     stays valid after the lock drops;
+     *   - never hold this lock across StatefulSession::sync/submit, i.e.
+     *     across StatefulDevice::wait. Lock order is DriverData -> session
+     *     mutex, never the reverse (destroySurfaces holds this exclusively
+     *     while release_frame takes the session mutex; vaDeriveImage drops the
+     *     session's hold() before taking this one).
+     * destroySurfaces refuses to erase a surface still VASurfaceRendering
+     * (VA_STATUS_ERROR_SURFACE_BUSY) so the in-flight assumption holds even if
+     * a client misbehaves.
+     */
+    std::shared_mutex mutex;
 };
 
 extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context);
