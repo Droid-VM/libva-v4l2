@@ -59,6 +59,17 @@ Buffer::Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID der
 {
 }
 
+Buffer::Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id, uint8_t* external_data)
+    : type(type)
+    , count(count)
+    , data(nullptr)
+    , external_data(external_data)
+    , size(size)
+    , derived_surface_id(derived_surface_id)
+    , info({ .handle = static_cast<uintptr_t>(-1) })
+{
+}
+
 VAStatus createBuffer(VADriverContextP context, VAContextID context_id, VABufferType type, unsigned int size,
     unsigned int count, void* data, VABufferID* buffer_id)
 {
@@ -114,7 +125,7 @@ VAStatus mapBuffer(VADriverContextP context, VABufferID buffer_id, void** data_m
     }
 
     /* Our buffers are always mapped. */
-    *data_map = driver_data->buffers.at(buffer_id).data.get();
+    *data_map = driver_data->buffers.at(buffer_id).map();
 
     return VA_STATUS_SUCCESS;
 }

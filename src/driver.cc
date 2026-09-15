@@ -27,6 +27,7 @@
 
 #include "driver.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -66,7 +67,11 @@ DriverData::DriverData(const std::vector<std::pair<std::string, std::optional<st
     : devices()
 {
     for (auto&& [video_path, media_path] : device_paths) {
-        devices.emplace_back(video_path, media_path);
+        try {
+            devices.emplace_back(video_path, media_path);
+        } catch (const std::exception&) {
+            /* An unusable or vanished node must not kill driver init. */
+        }
     }
 }
 
@@ -86,6 +91,15 @@ extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
         devices.push_back({ video_path_env.value(), media_path_env });
     }
     auto driver_data = new DriverData(devices);
+    if (driver_data->devices.empty()) {
+        /* No usable V4L2 decode node: fail vaInitialize cleanly. */
+        error_log(context, "No usable V4L2 M2M decode device found.\n");
+        delete driver_data;
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    const bool stateful = std::ranges::any_of(
+        driver_data->devices, [](const V4L2M2MDevice& device) { return device.stateful_decoder(); });
 
     struct VADriverVTable* vtable = context->vtable;
 
@@ -97,7 +111,7 @@ extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
     context->max_image_formats = V4L2_MAX_IMAGE_FORMATS;
     context->max_subpic_formats = V4L2_MAX_SUBPIC_FORMATS;
     context->max_display_attributes = V4L2_MAX_DISPLAY_ATTRIBUTES;
-    context->str_vendor = V4L2_STR_VENDOR;
+    context->str_vendor = stateful ? V4L2_STR_VENDOR_STATEFUL : V4L2_STR_VENDOR;
 
     vtable->vaTerminate = terminate;
     vtable->vaQueryConfigEntrypoints = queryConfigEntrypoints;

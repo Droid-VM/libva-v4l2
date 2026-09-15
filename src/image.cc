@@ -39,15 +39,54 @@ extern "C" {
 #include "buffer.h"
 #include "driver.h"
 #include "format.h"
+#include "stateful/h264_context.h"
 #include "surface.h"
 #include "utils.h"
 #include "v4l2.h"
 
 namespace {
 
+/* Stateful path (VPU_DESIGN.md 7.6 point 4): row-wise NV12 copy from the
+ * claimed CAPTURE buffer's mmap, honouring the G_FMT stride. */
+VAStatus copy_stateful_surface_to_image(DriverData* driver_data, const Surface& surface, VAImage* image)
+{
+    if (!driver_data->buffers.contains(image->buf)) {
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    auto& buffer = driver_data->buffers.at(image->buf);
+
+    auto view = surface.stateful_context->frame_view(surface);
+    if (!view) {
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+
+    if (image->num_planes != 2) {
+        return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
+    }
+
+    const unsigned luma_rows = std::min<unsigned>(image->height, view->coded_height);
+    const unsigned row_bytes = std::min<unsigned>(image->pitches[0], view->pitch);
+    for (unsigned row = 0; row < luma_rows; row++) {
+        std::copy_n(view->luma.data() + static_cast<size_t>(row) * view->pitch, row_bytes,
+            buffer.map() + image->offsets[0] + static_cast<size_t>(row) * image->pitches[0]);
+    }
+    const unsigned chroma_rows = std::min<unsigned>((image->height + 1) / 2, view->coded_height / 2);
+    const unsigned chroma_bytes = std::min<unsigned>(image->pitches[1], view->pitch);
+    for (unsigned row = 0; row < chroma_rows; row++) {
+        std::copy_n(view->chroma.data() + static_cast<size_t>(row) * view->pitch, chroma_bytes,
+            buffer.map() + image->offsets[1] + static_cast<size_t>(row) * image->pitches[1]);
+    }
+
+    return VA_STATUS_SUCCESS;
+}
+
 VAStatus copy_surface_to_image(DriverData* driver_data, const Surface& surface, VAImage* image)
 {
     unsigned int i;
+
+    if (surface.stateful_context != nullptr) {
+        return copy_stateful_surface_to_image(driver_data, surface, image);
+    }
 
     if (!driver_data->buffers.contains(image->buf)) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -151,6 +190,47 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     auto& surface = driver_data->surfaces.at(surface_id);
+
+    if (surface.stateful_context != nullptr) {
+        /* 7.6 point 4: map the claimed CAPTURE buffer's NV12 mmap directly,
+         * with the G_FMT stride. */
+        if (surface.status == VASurfaceRendering) {
+            status = syncSurface(context, surface_id);
+            if (status != VA_STATUS_SUCCESS)
+                return status;
+        }
+        auto view = surface.stateful_context->frame_view(surface);
+        if (!view || view->contiguous.empty()) {
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+
+        memset(image, 0, sizeof(*image));
+        image->format = { .fourcc = VA_FOURCC_NV12, .byte_order = VA_LSB_FIRST, .bits_per_pixel = 12 };
+        image->width = surface.width;
+        image->height = surface.height;
+        image->data_size = view->contiguous.size();
+        image->num_planes = 2;
+        image->pitches[0] = view->pitch;
+        image->pitches[1] = view->pitch;
+        image->offsets[0] = 0;
+        image->offsets[1] = view->pitch * view->coded_height;
+
+        std::lock_guard<std::mutex> guard(driver_data->mutex);
+        VABufferID buffer_id = smallest_free_key(driver_data->buffers);
+        driver_data->buffers.emplace(std::make_pair(
+            buffer_id, Buffer(VAImageBufferType, 1, image->data_size, surface_id, view->contiguous.data())));
+        image->buf = buffer_id;
+
+        image->image_id = smallest_free_key(driver_data->images);
+        auto [image_it, inserted] = driver_data->images.emplace(std::make_pair(image->image_id, *image));
+        if (!inserted) {
+            driver_data->buffers.erase(buffer_id);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+
+        surface.status = VASurfaceReady;
+        return VA_STATUS_SUCCESS;
+    }
 
     // Attempt to derive image from uninitialized surface
     if (!surface.destination_buffer) {

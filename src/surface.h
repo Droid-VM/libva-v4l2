@@ -42,6 +42,7 @@ extern "C" {
 #include "v4l2.h"
 
 struct DriverData;
+class StatefulH264Context;
 
 struct Surface {
     VASurfaceStatus status;
@@ -81,6 +82,14 @@ struct Surface {
     } params;
 
     int request_fd;
+
+    /* Stateful decode path (VPU_DESIGN.md 7.6 point 4): the surface is a
+     * logical slot; the context that rendered into it, the 64-bit sequence
+     * carried in the OUTPUT buffer timestamp, and -- once vaSyncSurface
+     * claimed it -- the CAPTURE buffer holding the decoded frame. */
+    StatefulH264Context* stateful_context = nullptr;
+    uint64_t stateful_sequence = 0;
+    int stateful_capture_index = -1;
 };
 
 void createSurfacesDeferred(DriverData* driver_data, const Context& context, std::span<VASurfaceID> surface_ids);

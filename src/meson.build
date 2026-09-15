@@ -50,6 +50,7 @@ sources = [
 	'stateful/h264_bitstream.cc',
 	'stateful/session.cc',
 	'stateful/v4l2_device.cc',
+	'stateful/h264_context.cc',
 ]
 
 headers = [
@@ -73,6 +74,7 @@ headers = [
 	'stateful/h264_bitstream.h',
 	'stateful/session.h',
 	'stateful/v4l2_device.h',
+	'stateful/h264_context.h',
 ]
 cpp_args = [
 	'-Wall',
@@ -117,3 +119,11 @@ test_session = executable('test_stateful_session',
 	cpp_args: cpp_args,
 	dependencies: [ kernel_dep ])
 test('stateful-session', test_session)
+
+dl_dep = cc.find_library('dl', required: false)
+
+test_probe = executable('test_driver_probe',
+	[ '../test/stateful/test_driver_probe.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, dl_dep ])
+test('driver-probe', test_probe, args: [ v4l2_drv_video ])

@@ -44,6 +44,7 @@ extern "C" {
 #include "driver.h"
 #include "h264.h"
 #include "mpeg2.h"
+#include "stateful/h264_context.h"
 #include "surface.h"
 #include "utils.h"
 #include "v4l2.h"
@@ -60,6 +61,9 @@ std::set<VAProfile> Context::supported_profiles(const std::vector<V4L2M2MDevice>
             result.insert(profile);
         }
         for (auto&& profile : H264Context::supported_profiles(device)) {
+            result.insert(profile);
+        }
+        for (auto&& profile : StatefulH264Context::supported_profiles(device)) {
             result.insert(profile);
         }
         for (auto&& profile : VP8Context::supported_profiles(device)) {
@@ -83,6 +87,9 @@ Context* Context::create(DriverData* driver_data, VAProfile profile, int picture
         }
         if (H264Context::supported_profiles(device).contains(profile)) {
             return new H264Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
+        }
+        if (StatefulH264Context::supported_profiles(device).contains(profile)) {
+            return new StatefulH264Context(driver_data, device, profile, picture_width, picture_height, surface_ids);
         }
         if (VP8Context::supported_profiles(device).contains(profile)) {
             return new VP8Context(driver_data, device, picture_width, picture_height, surface_ids);
@@ -119,10 +126,23 @@ Context::Context(DriverData* driver_data, V4L2M2MDevice& dev, fourcc pixelformat
     device.set_streaming(true);
 }
 
+Context::Context(DriverData* driver_data, V4L2M2MDevice& dev, int picture_width, int picture_height)
+    : render_surface_id(VA_INVALID_ID)
+    , picture_width(picture_width)
+    , picture_height(picture_height)
+    , driver_data(driver_data)
+    , device(dev)
+{
+}
+
 Context::~Context()
 {
-    device.set_streaming(false);
-    device.request_buffers(device.capture_buf_type, 0);
+    try {
+        device.set_streaming(false);
+        device.request_buffers(device.capture_buf_type, 0);
+    } catch (const std::exception&) {
+        /* The device may already be gone; a destructor must not throw. */
+    }
 }
 
 VAStatus createContext(VADriverContextP va_context, VAConfigID config_id, int picture_width, int picture_height,

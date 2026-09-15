@@ -37,10 +37,16 @@ extern "C" {
 
 struct Buffer {
     Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id);
+    /* A buffer over externally owned memory (a CAPTURE buffer mmap for a
+     * derived image on the stateful path); nothing is allocated or freed. */
+    Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id, uint8_t* external_data);
+
+    uint8_t* map() const { return external_data != nullptr ? external_data : data.get(); }
 
     VABufferType type;
     unsigned count;
     std::unique_ptr<uint8_t> data;
+    uint8_t* external_data = nullptr;
     unsigned int size;
     VASurfaceID derived_surface_id;
     VABufferInfo info;

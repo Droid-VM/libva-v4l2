@@ -66,6 +66,10 @@ VAStatus beginPicture(VADriverContextP va_context, VAContextID context_id, VASur
         return VA_STATUS_ERROR_SURFACE_BUSY;
     }
 
+    /* Stateful path: a reused surface re-queues its CAPTURE buffer
+     * (VPU_DESIGN.md 7.6 point 4). */
+    context.stateful_begin_picture(surface);
+
     surface.status = VASurfaceRendering;
     context.render_surface_id = surface_id;
 
@@ -108,7 +112,16 @@ VAStatus endPicture(VADriverContextP va_context, VAContextID context_id)
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     auto& context = *driver_data->contexts.at(context_id);
+    if (!driver_data->surfaces.contains(context.render_surface_id)) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
     auto& surface = driver_data->surfaces.at(context.render_surface_id);
+
+    if (context.is_stateful()) {
+        /* One access unit per vaEndPicture into one OUTPUT buffer
+         * (VPU_DESIGN.md 7.6 point 3). */
+        return context.stateful_end_picture(va_context, surface);
+    }
 
     gettimeofday(&surface.timestamp, NULL);
 

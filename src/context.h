@@ -37,6 +37,7 @@ extern "C" {
 #include "v4l2.h"
 
 struct DriverData;
+struct Surface;
 
 class Context {
 public:
@@ -51,11 +52,28 @@ public:
     virtual VAStatus store_buffer(const Buffer& buffer) const = 0;
     virtual int set_controls() = 0;
 
+    /* Stateful decode path (VPU_DESIGN.md 7.6): a stateful context owns the
+     * whole queue lifecycle, so vaBeginPicture/vaEndPicture divert to these
+     * hooks instead of the stateless per-request flow. */
+    virtual bool is_stateful() const { return false; }
+    virtual void stateful_begin_picture(Surface& surface) { (void)surface; }
+    virtual VAStatus stateful_end_picture(VADriverContextP va_context, Surface& surface)
+    {
+        (void)va_context;
+        (void)surface;
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
     VASurfaceID render_surface_id;
     int picture_width;
     int picture_height;
     DriverData* driver_data;
     V4L2M2MDevice& device;
+
+protected:
+    /* For stateful contexts: no capture allocation, no per-surface buffer
+     * binding, no streaming -- the session does that itself. */
+    Context(DriverData* driver_data, V4L2M2MDevice& device, int picture_width, int picture_height);
 };
 
 VAStatus createContext(VADriverContextP va_context, VAConfigID config_id, int picture_width, int picture_height,

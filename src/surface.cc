@@ -48,6 +48,7 @@ extern "C" {
 #include "driver.h"
 #include "format.h"
 #include "media.h"
+#include "stateful/h264_context.h"
 #include "utils.h"
 #include "v4l2.h"
 
@@ -116,7 +117,7 @@ void createSurfacesDeferred(DriverData* driver_data, const Context& context, std
                     driver_format->plane_fmt[j].sizeimage,
                     driver_format->plane_fmt[j].bytesperline,
                     (j > 0) ? (surface.logical_destination_layout[j - 1].offset
-                                  + surface.logical_destination_layout[j - 1].size)
+                        + surface.logical_destination_layout[j - 1].size)
                             : 0,
                 });
             }
@@ -143,6 +144,11 @@ VAStatus destroySurfaces(VADriverContextP context, VASurfaceID* surfaces_ids, in
         }
         auto& surface = driver_data->surfaces.at(surfaces_ids[i]);
 
+        if (surface.stateful_context != nullptr) {
+            /* Re-queue the surface's CAPTURE buffer (7.6 point 4). */
+            surface.stateful_context->release_surface(surface);
+        }
+
         if (surface.request_fd > 0)
             close(surface.request_fd);
 
@@ -160,6 +166,10 @@ VAStatus syncSurface(VADriverContextP context, VASurfaceID surface_id)
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     auto& surface = driver_data->surfaces.at(surface_id);
+
+    if (surface.stateful_context != nullptr) {
+        return surface.stateful_context->sync_surface(context, surface);
+    }
 
     if (surface.status != VASurfaceRendering) {
         return VA_STATUS_SUCCESS;
@@ -286,8 +296,20 @@ VAStatus exportSurfaceHandle(
     }
     const auto& surface = driver_data->surfaces.at(surface_id);
 
+    if (surface.stateful_context != nullptr) {
+        /* VA1 has no zero-copy path (7.6 point 7): the virtio-media device
+         * has no VIDIOC_EXPBUF/DMABUF support. Browsers fall back to software
+         * decode on this status. */
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    }
+
     if (!surface.destination_buffer.has_value()) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    if (!(surface.destination_buffer->get().owner().buffer_capabilities & V4L2_BUF_CAP_SUPPORTS_DMABUF)) {
+        /* Never reach VIDIOC_EXPBUF on a device that cannot export. */
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
     }
 
     std::vector<int> export_fds;

@@ -46,6 +46,8 @@ extern "C" {
 class Context;
 
 #define V4L2_STR_VENDOR "v4l2"
+/* Shown by vainfo so it is obvious which path answered (VPU_DESIGN.md 7.6). */
+#define V4L2_STR_VENDOR_STATEFUL "DroidVM libva-v4l2 (stateful virtio-media)"
 #define V4L2_MAX_PROFILES 11
 #define V4L2_MAX_ENTRYPOINTS 5
 #define V4L2_MAX_IMAGE_FORMATS 10
