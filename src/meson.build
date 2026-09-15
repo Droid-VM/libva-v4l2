@@ -133,6 +133,17 @@ test_session_threads = executable('test_stateful_session_threads',
 	dependencies: [ kernel_dep, thread_dep ])
 test('stateful-session-threads', test_session_threads)
 
+# VA3 (VPU_DESIGN.md 7.7): the gbm-dmabuf CAPTURE path -- mode/fallback ladder,
+# the DMABUF QBUF plane fields, the bo-backed derive/get view, and the pure
+# PRIME export-descriptor layout and pre-sync gate. Drives the session against
+# the scripted device seam and a memfd-backed allocator fake; needs libva/libdrm
+# for the VA/DRM types (no real GBM on the host).
+test_gbm_surface = executable('test_gbm_surface',
+	[ '../test/stateful/test_gbm_surface.cc', 'stateful/session.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, libdrm_dep, kernel_dep ])
+test('gbm-surface', test_gbm_surface)
+
 # D83: the driver-wide id->object maps read on the hot path while another
 # frame thread inserts/erases (vaCreateBuffer/vaDestroyBuffer per picture).
 # This links the whole backend and drives the real vtable entry points from
