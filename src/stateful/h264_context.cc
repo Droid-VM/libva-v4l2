@@ -79,6 +79,8 @@ StatefulH264Context::~StatefulH264Context()
 
 VAStatus StatefulH264Context::store_buffer(const Buffer& buffer) const
 {
+    std::lock_guard<std::mutex> guard(builder_mutex_);
+
     switch (buffer.type) {
     case VAPictureParameterBufferType:
         au_builder_.set_picture_parameters(*reinterpret_cast<const VAPictureParameterBufferH264*>(buffer.data.get()));
@@ -122,6 +124,7 @@ VAStatus StatefulH264Context::stateful_end_picture(VADriverContextP va_context, 
 {
     std::vector<uint8_t> access_unit;
     try {
+        std::lock_guard<std::mutex> guard(builder_mutex_);
         access_unit = au_builder_.finish(surface.width, surface.height);
     } catch (const std::exception& e) {
         error_log(va_context, "Failed to synthesize access unit: %s\n", e.what());
@@ -132,7 +135,11 @@ VAStatus StatefulH264Context::stateful_end_picture(VADriverContextP va_context, 
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
-    const uint64_t sequence = next_sequence_++;
+    uint64_t sequence;
+    {
+        std::lock_guard<std::mutex> guard(builder_mutex_);
+        sequence = next_sequence_++;
+    }
     try {
         session_.submit(sequence, access_unit);
     } catch (const std::exception& e) {

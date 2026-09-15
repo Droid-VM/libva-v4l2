@@ -64,6 +64,15 @@ namespace {
 
 } // namespace
 
+/*
+ * Locking (D83): mutex_ guards every field and every device call EXCEPT
+ * StatefulDevice::wait, which can sleep. wait_for_progress() elects exactly
+ * one harvester: it drops the lock, waits on the device, retakes the lock,
+ * pumps, and wakes the condvar; every other thread sleeps on the condvar in
+ * bounded slices. So no thread ever sleeps for the device while holding the
+ * lock, and no two threads DQBUF concurrently.
+ */
+
 StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelformat, unsigned coded_width,
     unsigned coded_height, const Options& options, std::function<void(const char*)> log)
     : device_(device)
@@ -75,6 +84,8 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , coded_width_(coded_width)
     , coded_height_(coded_height)
 {
+    /* Construction is single-threaded: the context does not exist yet. */
+
     /* Subscribe before streaming so the first SOURCE_CHANGE cannot be lost. */
     device_.subscribe_events();
 
@@ -104,11 +115,11 @@ void StatefulSession::log(const char* message)
     }
 }
 
-void StatefulSession::pump()
+void StatefulSession::pump_locked()
 {
     while (auto event = device_.dequeue_event()) {
         if (*event == DeviceEvent::source_change) {
-            handle_source_change();
+            handle_source_change_locked();
         }
     }
 
@@ -123,7 +134,7 @@ void StatefulSession::pump()
 
     if (capture_streaming_) {
         while (auto frame = device_.dequeue_capture()) {
-            handle_capture(*frame);
+            handle_capture_locked(*frame);
             if (frame->last) {
                 break;
             }
@@ -131,7 +142,31 @@ void StatefulSession::pump()
     }
 }
 
-void StatefulSession::handle_source_change()
+void StatefulSession::wait_for_progress(std::unique_lock<std::mutex>& lock, int timeout_ms, bool include_output)
+{
+    if (harvesting_) {
+        /* Someone else is at the device; it will pump and notify. */
+        cv_.wait_for(lock, std::chrono::milliseconds(std::max(timeout_ms, 1)));
+        return;
+    }
+
+    harvesting_ = true;
+    lock.unlock();
+    try {
+        device_.wait(timeout_ms, include_output);
+    } catch (...) {
+        lock.lock();
+        harvesting_ = false;
+        cv_.notify_all();
+        throw;
+    }
+    lock.lock();
+    harvesting_ = false;
+    pump_locked();
+    cv_.notify_all();
+}
+
+void StatefulSession::handle_source_change_locked()
 {
     if (provisioned_) {
         /* Mid-stream resolution change: VA1 re-provisions and drops what was
@@ -164,9 +199,10 @@ void StatefulSession::handle_source_change()
     device_.stream_capture(true);
     capture_streaming_ = true;
     provisioned_ = true;
+    cv_.notify_all();
 }
 
-void StatefulSession::handle_capture(const DequeuedCapture& frame)
+void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
 {
     if (frame.index == DequeuedCapture::no_buffer) {
         return; /* synthetic end-of-drain marker */
@@ -181,18 +217,31 @@ void StatefulSession::handle_capture(const DequeuedCapture& frame)
         return;
     }
     stash_[frame.sequence] = frame.index;
+    cv_.notify_all();
 }
 
-int StatefulSession::acquire_output_buffer(size_t needed)
+bool StatefulSession::claim_locked(uint64_t sequence, unsigned* capture_index)
+{
+    auto it = stash_.find(sequence);
+    if (it == stash_.end()) {
+        return false;
+    }
+    *capture_index = it->second;
+    client_owned_.insert(it->second);
+    stash_.erase(it);
+    return true;
+}
+
+int StatefulSession::acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(sync_timeout_ms_);
 
     if (needed > output_size_) {
-        grow_output_buffers(needed);
+        grow_output_buffers_locked(lock, needed);
     }
 
     while (true) {
-        pump();
+        pump_locked();
         if (!free_outputs_.empty()) {
             int index = static_cast<int>(free_outputs_.back());
             free_outputs_.pop_back();
@@ -201,11 +250,11 @@ int StatefulSession::acquire_output_buffer(size_t needed)
         if (Clock::now() >= deadline) {
             return -1;
         }
-        device_.wait(std::min(kWaitSliceMs, remaining_ms(deadline) + 1), true);
+        wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), true);
     }
 }
 
-void StatefulSession::grow_output_buffers(size_t needed)
+void StatefulSession::grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed)
 {
     uint32_t new_size = std::max<size_t>(needed, static_cast<size_t>(output_size_) * 2);
     new_size = (new_size + 0xffffu) & ~0xffffu; /* round up to 64 KiB */
@@ -240,9 +289,9 @@ void StatefulSession::grow_output_buffers(size_t needed)
         if (Clock::now() >= deadline) {
             throw std::runtime_error("cannot grow OUTPUT buffers: queue never went idle");
         }
-        pump();
+        pump_locked();
         if (queued_outputs_ > 0) {
-            device_.wait(std::min(kWaitSliceMs, remaining_ms(deadline) + 1), true);
+            wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), true);
         }
     }
     device_.stream_output(false);
@@ -264,6 +313,8 @@ void StatefulSession::grow_output_buffers(size_t needed)
 
 void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_unit)
 {
+    std::unique_lock<std::mutex> lock(mutex_);
+
     if (dead_) {
         throw std::runtime_error("session is dead");
     }
@@ -272,7 +323,7 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
     }
 
     try {
-        int index = acquire_output_buffer(access_unit.size());
+        int index = acquire_output_buffer_locked(lock, access_unit.size());
         if (index < 0) {
             throw std::runtime_error("timed out waiting for a free OUTPUT buffer");
         }
@@ -283,24 +334,27 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
         std::copy(access_unit.begin(), access_unit.end(), plane.begin());
         device_.queue_output(static_cast<unsigned>(index), sequence, access_unit.size());
         queued_outputs_ += 1;
+        cv_.notify_all();
     } catch (const DeviceLost&) {
         dead_ = true;
+        cv_.notify_all();
         throw;
     }
 }
 
-bool StatefulSession::drain_capture(int timeout_ms)
+bool StatefulSession::drain_capture_locked(std::unique_lock<std::mutex>& lock, int timeout_ms)
 {
+    /* The caller owns harvesting_: no other thread is at the device. */
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
 
     while (true) {
         while (auto event = device_.dequeue_event()) {
             if (*event == DeviceEvent::source_change) {
-                handle_source_change();
+                handle_source_change_locked();
             }
         }
         while (auto frame = device_.dequeue_capture()) {
-            handle_capture(*frame);
+            handle_capture_locked(*frame);
             if (frame->last) {
                 return true;
             }
@@ -308,12 +362,64 @@ bool StatefulSession::drain_capture(int timeout_ms)
         if (Clock::now() >= deadline) {
             return false;
         }
-        device_.wait(std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+        lock.unlock();
+        try {
+            device_.wait(std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+        } catch (...) {
+            lock.lock();
+            throw;
+        }
+        lock.lock();
     }
+}
+
+StatefulSession::SyncStatus StatefulSession::recover_locked(
+    std::unique_lock<std::mutex>& lock, uint64_t sequence, unsigned* capture_index)
+{
+    /* One recovery at a time: wait out any harvester (its pump may deliver
+     * our frame), then own the role for the whole stop/drain/start. */
+    while (harvesting_) {
+        cv_.wait_for(lock, std::chrono::milliseconds(kWaitSliceMs));
+        if (claim_locked(sequence, capture_index)) {
+            return SyncStatus::ok;
+        }
+    }
+    harvesting_ = true;
+
+    SyncStatus status = SyncStatus::decode_error;
+    try {
+        /* 7.6 point 5b: assume a reorder deadlock -- the decoder holds
+         * frames the client is waiting for. Drain and restart; count
+         * it (the B18 bar wants 0 on the 1080p reference clip). */
+        timeout_recoveries_ += 1;
+        char line[160];
+        snprintf(line, sizeof(line),
+            "sync timeout after %d ms on sequence %llu: DEC_CMD_STOP drain + restart (occurrence %u)", sync_timeout_ms_,
+            static_cast<unsigned long long>(sequence), timeout_recoveries_);
+        log(line);
+
+        device_.decoder_stop();
+        drain_capture_locked(lock, sync_timeout_ms_);
+        device_.decoder_start();
+        pump_locked();
+
+        if (claim_locked(sequence, capture_index)) {
+            status = SyncStatus::ok;
+        }
+    } catch (...) {
+        harvesting_ = false;
+        cv_.notify_all();
+        throw;
+    }
+    harvesting_ = false;
+    cv_.notify_all();
+    return status;
 }
 
 StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* capture_index)
 {
+    std::unique_lock<std::mutex> lock(mutex_);
+
     if (dead_) {
         return SyncStatus::dead;
     }
@@ -322,43 +428,24 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* c
 
     try {
         while (true) {
-            pump();
+            pump_locked();
 
-            if (auto it = stash_.find(sequence); it != stash_.end()) {
-                *capture_index = it->second;
-                client_owned_.insert(it->second);
-                stash_.erase(it);
+            if (claim_locked(sequence, capture_index)) {
                 return SyncStatus::ok;
+            }
+            if (dead_) {
+                return SyncStatus::dead;
             }
 
             if (Clock::now() >= deadline) {
-                /* 7.6 point 5b: assume a reorder deadlock -- the decoder holds
-                 * frames the client is waiting for. Drain and restart; count
-                 * it (the B18 bar wants 0 on the 1080p reference clip). */
-                timeout_recoveries_ += 1;
-                char line[160];
-                snprintf(line, sizeof(line),
-                    "sync timeout after %d ms on sequence %llu: DEC_CMD_STOP drain + restart (occurrence %u)",
-                    sync_timeout_ms_, static_cast<unsigned long long>(sequence), timeout_recoveries_);
-                log(line);
-
-                device_.decoder_stop();
-                drain_capture(sync_timeout_ms_);
-                device_.decoder_start();
-
-                if (auto it = stash_.find(sequence); it != stash_.end()) {
-                    *capture_index = it->second;
-                    client_owned_.insert(it->second);
-                    stash_.erase(it);
-                    return SyncStatus::ok;
-                }
-                return SyncStatus::decode_error;
+                return recover_locked(lock, sequence, capture_index);
             }
 
-            device_.wait(std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+            wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
         }
     } catch (const DeviceLost&) {
         dead_ = true;
+        cv_.notify_all();
         return SyncStatus::dead;
     } catch (const std::exception&) {
         return SyncStatus::decode_error;
@@ -367,23 +454,38 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* c
 
 void StatefulSession::release_frame(unsigned capture_index)
 {
+    std::unique_lock<std::mutex> lock(mutex_);
+
     client_owned_.erase(capture_index);
     if (dead_ || !capture_streaming_) {
         return;
     }
     try {
         device_.queue_capture(capture_index);
+        cv_.notify_all(); /* a free CAPTURE buffer lets the decoder progress */
     } catch (const DeviceLost&) {
         dead_ = true;
+        cv_.notify_all();
     }
 }
 
 void StatefulSession::drop_sequence(uint64_t sequence)
 {
+    std::unique_lock<std::mutex> lock(mutex_);
+
     if (auto it = stash_.find(sequence); it != stash_.end()) {
         unsigned index = it->second;
         stash_.erase(it);
-        release_frame(index);
+        if (dead_ || !capture_streaming_) {
+            return;
+        }
+        try {
+            device_.queue_capture(index);
+            cv_.notify_all();
+        } catch (const DeviceLost&) {
+            dead_ = true;
+            cv_.notify_all();
+        }
         return;
     }
     unwanted_sequences_.insert(sequence);
@@ -391,12 +493,20 @@ void StatefulSession::drop_sequence(uint64_t sequence)
 
 void StatefulSession::finish()
 {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    /* Exclusive teardown: wait out any thread still at the device. */
+    while (harvesting_) {
+        cv_.wait_for(lock, std::chrono::milliseconds(kWaitSliceMs));
+    }
+    harvesting_ = true;
+
     if (!dead_) {
         try {
             /* 7.6 point 6: DEC_CMD_STOP, drain to LAST, then tear down. */
             if (capture_streaming_ && queued_outputs_ > 0) {
                 device_.decoder_stop();
-                drain_capture(sync_timeout_ms_);
+                drain_capture_locked(lock, sync_timeout_ms_);
             }
         } catch (const std::exception&) {
             dead_ = true;
@@ -419,6 +529,9 @@ void StatefulSession::finish()
     free_outputs_.clear();
     usable_outputs_.clear();
     queued_outputs_ = 0;
+
+    harvesting_ = false;
+    cv_.notify_all();
 }
 
 } // namespace stateful

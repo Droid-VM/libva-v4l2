@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -86,10 +87,18 @@ public:
     };
     std::optional<FrameView> frame_view(const Surface& surface);
 
+    /* Serialise a reader of decoded frame memory (vaGetImage/vaDeriveImage)
+     * against CAPTURE re-provisioning (D83). Do not take the driver-wide
+     * mutex while holding this (lock order: driver mutex, then session). */
+    std::unique_lock<std::mutex> hold_frames() { return session_.hold(); }
+
 private:
     VAProfile profile_;
     stateful::V4L2StatefulDevice device_io_;
     stateful::StatefulSession session_;
+    /* D83: guards au_builder_ and next_sequence_ against concurrent
+     * vaRenderPicture/vaEndPicture calls; never held across session waits. */
+    mutable std::mutex builder_mutex_;
     mutable stateful::H264AccessUnitBuilder au_builder_;
     uint64_t next_sequence_ = 1;
 };

@@ -55,6 +55,9 @@ VAStatus copy_stateful_surface_to_image(DriverData* driver_data, const Surface& 
     }
     auto& buffer = driver_data->buffers.at(image->buf);
 
+    /* D83: hold the session while reading the CAPTURE mmap so a concurrent
+     * re-provision cannot unmap it mid-copy. */
+    auto frames_guard = surface.stateful_context->hold_frames();
     auto view = surface.stateful_context->frame_view(surface);
     if (!view) {
         return VA_STATUS_ERROR_SURFACE_BUSY;
@@ -199,6 +202,7 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
             if (status != VA_STATUS_SUCCESS)
                 return status;
         }
+        auto frames_guard = surface.stateful_context->hold_frames();
         auto view = surface.stateful_context->frame_view(surface);
         if (!view || view->contiguous.empty()) {
             return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -214,6 +218,12 @@ VAStatus deriveImage(VADriverContextP context, VASurfaceID surface_id, VAImage* 
         image->pitches[1] = view->pitch;
         image->offsets[0] = 0;
         image->offsets[1] = view->pitch * view->coded_height;
+
+        /* Lock order is driver mutex before session mutex (destroySurfaces
+         * holds the former while releasing frames): drop the session guard
+         * before taking the driver mutex. The mapped pointer escaping into
+         * the image buffer is inherent to vaDeriveImage. */
+        frames_guard.unlock();
 
         std::lock_guard<std::mutex> guard(driver_data->mutex);
         VABufferID buffer_id = smallest_free_key(driver_data->buffers);

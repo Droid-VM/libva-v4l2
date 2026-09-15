@@ -24,9 +24,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <vector>
@@ -41,6 +44,14 @@ namespace stateful {
  * copies the tag to the decoded CAPTURE buffer; sync() collects CAPTURE
  * buffers into a sequence-keyed stash until the requested one arrives, with
  * the bounded-wait DEC_CMD_STOP/drain/START recovery of point 5b.
+ *
+ * Thread safety (D83): ffmpeg's vaapi hwaccel is HWACCEL_CAP_ASYNC_SAFE, so
+ * frame threads call vaBeginPicture/vaEndPicture/vaSyncSurface concurrently
+ * on one context. Every public entry point serialises on an internal mutex;
+ * a thread that must sleep for the device does so through a single elected
+ * harvester with the mutex released (7.6 point 5: a sync waiting for frame S
+ * while holding the lock would starve the thread submitting more input into
+ * a deadlock).
  */
 class StatefulSession {
 public:
@@ -80,20 +91,34 @@ public:
      * + REQBUFS(0). */
     void finish();
 
-    bool dead() const { return dead_; }
-    bool provisioned() const { return provisioned_; }
+    /* Serialise an external reader of decoded frame memory (the vaGetImage /
+     * vaDeriveImage copies) against re-provisioning (D83). Never take the
+     * driver-wide mutex while holding this: the established order is
+     * driver mutex, then session mutex (destroySurfaces -> release_frame). */
+    std::unique_lock<std::mutex> hold() { return std::unique_lock<std::mutex>(mutex_); }
+
+    bool dead() const { return dead_.load(std::memory_order_relaxed); }
+    bool provisioned() const { return provisioned_.load(std::memory_order_relaxed); }
+    /* Stable once provisioned; under churn read it holding hold(). */
     const CaptureFormat& capture_format() const { return capture_format_; }
     unsigned timeout_recoveries() const { return timeout_recoveries_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     StatefulDevice& device() { return device_; }
 
 private:
-    void pump();
-    void handle_source_change();
-    void handle_capture(const DequeuedCapture& frame);
-    bool drain_capture(int timeout_ms); /* true when LAST was seen */
-    void grow_output_buffers(size_t needed);
-    int acquire_output_buffer(size_t needed); /* -1 on timeout */
+    /* _locked members run with mutex_ held. */
+    void pump_locked();
+    void handle_source_change_locked();
+    void handle_capture_locked(const DequeuedCapture& frame);
+    bool claim_locked(uint64_t sequence, unsigned* capture_index);
+    /* Drop the lock around one device wait; exactly one thread is the
+     * harvester at a time (the others sleep on the condvar). */
+    void wait_for_progress(std::unique_lock<std::mutex>& lock, int timeout_ms, bool include_output);
+    /* Caller owns harvesting_; true when LAST was seen. */
+    bool drain_capture_locked(std::unique_lock<std::mutex>& lock, int timeout_ms);
+    SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, unsigned* capture_index);
+    void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
+    int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
     void log(const char* message);
 
     StatefulDevice& device_;
@@ -106,13 +131,17 @@ private:
     uint32_t coded_height_;
     uint32_t output_size_ = 0;
 
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool harvesting_ = false; /* one device waiter/drainer at a time */
+
     std::vector<unsigned> free_outputs_;
     std::set<unsigned> usable_outputs_; /* current ring; retired buffers are dropped on dequeue */
     unsigned queued_outputs_ = 0;
 
     bool capture_streaming_ = false;
-    bool provisioned_ = false;
-    bool dead_ = false;
+    std::atomic<bool> provisioned_ { false };
+    std::atomic<bool> dead_ { false };
     CaptureFormat capture_format_ {};
     unsigned capture_count_ = 0;
 
