@@ -77,6 +77,7 @@ private:
     };
 
     int xioctl(unsigned long request, void* argument, const char* name);
+    void check_capture_index(unsigned index) const;
     void map_buffers(v4l2_buf_type type, unsigned first, unsigned count, std::vector<MappedBuffer>& buffers);
     static void unmap_buffers(std::vector<MappedBuffer>& buffers);
 

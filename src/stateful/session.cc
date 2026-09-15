@@ -193,6 +193,7 @@ void StatefulSession::handle_source_change_locked()
     if (capture_count_ == 0) {
         throw std::runtime_error("no CAPTURE buffers granted");
     }
+    generation_ += 1; /* D83: every binding handed out before this is stale */
     for (unsigned i = 0; i < capture_count_; i++) {
         device_.queue_capture(i);
     }
@@ -220,13 +221,14 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
     cv_.notify_all();
 }
 
-bool StatefulSession::claim_locked(uint64_t sequence, unsigned* capture_index)
+bool StatefulSession::claim_locked(uint64_t sequence, Frame* frame)
 {
     auto it = stash_.find(sequence);
     if (it == stash_.end()) {
         return false;
     }
-    *capture_index = it->second;
+    frame->index = it->second;
+    frame->generation = generation_;
     client_owned_.insert(it->second);
     stash_.erase(it);
     return true;
@@ -374,13 +376,13 @@ bool StatefulSession::drain_capture_locked(std::unique_lock<std::mutex>& lock, i
 }
 
 StatefulSession::SyncStatus StatefulSession::recover_locked(
-    std::unique_lock<std::mutex>& lock, uint64_t sequence, unsigned* capture_index)
+    std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame)
 {
     /* One recovery at a time: wait out any harvester (its pump may deliver
      * our frame), then own the role for the whole stop/drain/start. */
     while (harvesting_) {
         cv_.wait_for(lock, std::chrono::milliseconds(kWaitSliceMs));
-        if (claim_locked(sequence, capture_index)) {
+        if (claim_locked(sequence, frame)) {
             return SyncStatus::ok;
         }
     }
@@ -403,7 +405,7 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
         device_.decoder_start();
         pump_locked();
 
-        if (claim_locked(sequence, capture_index)) {
+        if (claim_locked(sequence, frame)) {
             status = SyncStatus::ok;
         }
     } catch (...) {
@@ -416,7 +418,7 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
     return status;
 }
 
-StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* capture_index)
+StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* frame)
 {
     std::unique_lock<std::mutex> lock(mutex_);
 
@@ -430,7 +432,7 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* c
         while (true) {
             pump_locked();
 
-            if (claim_locked(sequence, capture_index)) {
+            if (claim_locked(sequence, frame)) {
                 return SyncStatus::ok;
             }
             if (dead_) {
@@ -438,7 +440,7 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* c
             }
 
             if (Clock::now() >= deadline) {
-                return recover_locked(lock, sequence, capture_index);
+                return recover_locked(lock, sequence, frame);
             }
 
             wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
@@ -452,20 +454,40 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, unsigned* c
     }
 }
 
-void StatefulSession::release_frame(unsigned capture_index)
+void StatefulSession::release_frame(const Frame& frame)
 {
     std::unique_lock<std::mutex> lock(mutex_);
 
-    client_owned_.erase(capture_index);
+    if (frame.generation != generation_) {
+        /* D83: the pool was re-provisioned since this binding was handed
+         * out; its index means nothing now. Log once, never QBUF. */
+        if (!stale_release_logged_) {
+            stale_release_logged_ = true;
+            char line[128];
+            snprintf(line, sizeof(line), "ignoring release of stale CAPTURE index %u (generation %llu, pool at %llu)",
+                frame.index, static_cast<unsigned long long>(frame.generation),
+                static_cast<unsigned long long>(generation_));
+            log(line);
+        }
+        return;
+    }
+
+    client_owned_.erase(frame.index);
     if (dead_ || !capture_streaming_) {
         return;
     }
     try {
-        device_.queue_capture(capture_index);
+        device_.queue_capture(frame.index);
         cv_.notify_all(); /* a free CAPTURE buffer lets the decoder progress */
     } catch (const DeviceLost&) {
         dead_ = true;
         cv_.notify_all();
+    } catch (const std::exception& e) {
+        /* A refused QBUF loses one buffer; losing the session (or the whole
+         * process, as the D83 abort did) would be worse. */
+        char line[160];
+        snprintf(line, sizeof(line), "release of CAPTURE index %u failed: %s", frame.index, e.what());
+        log(line);
     }
 }
 

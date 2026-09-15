@@ -115,7 +115,8 @@ void StatefulH264Context::stateful_begin_picture(Surface& surface)
     /* 7.6 point 4: a surface reused by a later vaBeginPicture re-queues its
      * CAPTURE buffer. */
     if (surface.stateful_context == this && surface.stateful_capture_index >= 0) {
-        session_.release_frame(static_cast<unsigned>(surface.stateful_capture_index));
+        session_.release_frame(
+            { static_cast<unsigned>(surface.stateful_capture_index), surface.stateful_capture_generation });
         surface.stateful_capture_index = -1;
     }
 }
@@ -166,10 +167,11 @@ VAStatus StatefulH264Context::sync_surface(VADriverContextP va_context, Surface&
         return VA_STATUS_SUCCESS;
     }
 
-    unsigned capture_index = 0;
-    switch (session_.sync(surface.stateful_sequence, &capture_index)) {
+    stateful::StatefulSession::Frame frame;
+    switch (session_.sync(surface.stateful_sequence, &frame)) {
     case stateful::StatefulSession::SyncStatus::ok:
-        surface.stateful_capture_index = static_cast<int>(capture_index);
+        surface.stateful_capture_index = static_cast<int>(frame.index);
+        surface.stateful_capture_generation = frame.generation;
         surface.status = VASurfaceDisplaying;
         return VA_STATUS_SUCCESS;
     case stateful::StatefulSession::SyncStatus::dead:
@@ -184,7 +186,8 @@ VAStatus StatefulH264Context::sync_surface(VADriverContextP va_context, Surface&
 void StatefulH264Context::release_surface(Surface& surface)
 {
     if (surface.stateful_capture_index >= 0) {
-        session_.release_frame(static_cast<unsigned>(surface.stateful_capture_index));
+        session_.release_frame(
+            { static_cast<unsigned>(surface.stateful_capture_index), surface.stateful_capture_generation });
         surface.stateful_capture_index = -1;
     } else if (surface.status == VASurfaceRendering) {
         session_.drop_sequence(surface.stateful_sequence);
@@ -194,8 +197,9 @@ void StatefulH264Context::release_surface(Surface& surface)
 
 std::optional<StatefulH264Context::FrameView> StatefulH264Context::frame_view(const Surface& surface)
 {
-    if (surface.stateful_capture_index < 0 || !session_.provisioned()) {
-        return std::nullopt;
+    if (surface.stateful_capture_index < 0 || !session_.provisioned()
+        || surface.stateful_capture_generation != session_.generation()) {
+        return std::nullopt; /* stale binding after a re-provision (D83) */
     }
 
     const auto& format = session_.capture_format();

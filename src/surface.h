@@ -90,6 +90,9 @@ struct Surface {
     StatefulH264Context* stateful_context = nullptr;
     uint64_t stateful_sequence = 0;
     int stateful_capture_index = -1;
+    /* The CAPTURE provisioning generation the index belongs to (D83): a
+     * binding from before a re-provision is stale and is never re-queued. */
+    uint64_t stateful_capture_generation = 0;
 };
 
 void createSurfacesDeferred(DriverData* driver_data, const Context& context, std::span<VASurfaceID> surface_ids);

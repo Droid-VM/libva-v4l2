@@ -64,7 +64,7 @@ void test_provisioning_and_mapping()
     CHECK(!session.provisioned());
 
     session.submit(1, fake_au());
-    unsigned index = 999;
+    StatefulSession::Frame index;
     CHECK(session.sync(1, &index) == StatefulSession::SyncStatus::ok);
 
     /* SOURCE_CHANGE provisioned the pool: MIN_BUFFERS(4) + min(surfaces 6, 8)
@@ -96,15 +96,15 @@ void test_out_of_order_delivery_and_stash()
     device.deliver(3);
     device.deliver(1);
 
-    unsigned index1 = 999;
+    StatefulSession::Frame index1;
     CHECK(session.sync(1, &index1) == StatefulSession::SyncStatus::ok);
 
     /* 2 and 3 now come straight from the stash. */
-    unsigned index2 = 999;
+    StatefulSession::Frame index2;
     CHECK(session.sync(2, &index2) == StatefulSession::SyncStatus::ok);
-    unsigned index3 = 999;
+    StatefulSession::Frame index3;
     CHECK(session.sync(3, &index3) == StatefulSession::SyncStatus::ok);
-    CHECK(index1 != index2 && index2 != index3 && index1 != index3);
+    CHECK(index1.index != index2.index && index2.index != index3.index && index1.index != index3.index);
     CHECK_EQ(session.timeout_recoveries(), 0u);
 
     /* All three OUTPUT buffers were reclaimed (ring of 4 still has room). */
@@ -121,7 +121,7 @@ void test_drop_sequence_recycles()
     StatefulSession session(device, 0x34363248, 1920, 1088, fast_options());
 
     session.submit(1, fake_au());
-    unsigned index = 999;
+    StatefulSession::Frame index;
     CHECK(session.sync(1, &index) == StatefulSession::SyncStatus::ok);
     session.release_frame(index);
     const auto captures_free = device.free_captures.size();
@@ -131,7 +131,7 @@ void test_drop_sequence_recycles()
     session.submit(2, fake_au());
     session.drop_sequence(2);
     session.submit(3, fake_au());
-    unsigned index3 = 999;
+    StatefulSession::Frame index3;
     CHECK(session.sync(3, &index3) == StatefulSession::SyncStatus::ok);
     /* 2's buffer was recycled; only 3's is claimed. */
     CHECK_EQ(device.free_captures.size(), captures_free - 1);
@@ -154,25 +154,57 @@ void test_timeout_drain_recovery()
         device.deliver(3, /*last=*/true);
     };
 
-    unsigned index1 = 999;
+    StatefulSession::Frame index1;
     CHECK(session.sync(1, &index1) == StatefulSession::SyncStatus::ok);
     CHECK_EQ(session.timeout_recoveries(), 1u);
     CHECK_EQ(device.decoder_stops, 1u);
     CHECK_EQ(device.decoder_starts, 1u);
 
     /* The drain harvested every frame into the stash. */
-    unsigned index2 = 999;
+    StatefulSession::Frame index2;
     CHECK(session.sync(2, &index2) == StatefulSession::SyncStatus::ok);
-    unsigned index3 = 999;
+    StatefulSession::Frame index3;
     CHECK(session.sync(3, &index3) == StatefulSession::SyncStatus::ok);
     CHECK_EQ(session.timeout_recoveries(), 1u);
 
     /* A drain that yields only an empty LAST buffer: decode error. */
     session.submit(4, fake_au());
     device.on_decoder_stop = [&device]() { device.deliver_empty_last(); };
-    unsigned index4 = 999;
+    StatefulSession::Frame index4;
     CHECK(session.sync(4, &index4) == StatefulSession::SyncStatus::decode_error);
     CHECK_EQ(session.timeout_recoveries(), 2u);
+}
+
+void test_stale_release_after_reprovision()
+{
+    FakeDevice device;
+    StatefulSession session(device, 0x34363248, 1920, 1088, fast_options());
+
+    session.submit(1, fake_au());
+    StatefulSession::Frame frame1;
+    CHECK(session.sync(1, &frame1) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(frame1.generation, 1u);
+
+    /* A mid-stream SOURCE_CHANGE re-provisions the pool: every binding
+     * handed out before it is stale (D83). */
+    device.pending_events.push_back(stateful::DeviceEvent::source_change);
+    session.submit(2, fake_au());
+    StatefulSession::Frame frame2;
+    CHECK(session.sync(2, &frame2) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(frame2.generation, 2u);
+
+    /* Releasing the old binding is a no-op: no QBUF, no throw (B18's abort
+     * was exactly a stale index reaching the device from release_frame).
+     * Named mutation this fails under: remove the generation check in
+     * StatefulSession::release_frame -- the stale index is re-queued and
+     * the free count below moves. */
+    const auto free_before = device.free_captures.size();
+    session.release_frame(frame1);
+    CHECK_EQ(device.free_captures.size(), free_before);
+
+    /* The current-generation binding still releases normally. */
+    session.release_frame(frame2);
+    CHECK_EQ(device.free_captures.size(), free_before + 1);
 }
 
 void test_output_ring_growth()
@@ -208,13 +240,13 @@ void test_device_lost()
     device.manual_delivery = true;
     session.submit(1, fake_au());
     device.deliver(1);
-    unsigned index = 999;
+    StatefulSession::Frame index;
     CHECK(session.sync(1, &index) == StatefulSession::SyncStatus::ok);
 
     /* A second picture is in flight when the device disappears. */
     session.submit(2, fake_au());
     device.lose_device = true; /* ENODEV from here on (7.6 point 6) */
-    unsigned index2 = 999;
+    StatefulSession::Frame index2;
     CHECK(session.sync(2, &index2) == StatefulSession::SyncStatus::dead);
     CHECK(session.dead());
     /* Later syncs fail immediately. */
@@ -229,7 +261,7 @@ void test_submit_on_dead_device_throws()
     FakeDevice device;
     StatefulSession session(device, 0x34363248, 1920, 1088, fast_options());
     session.submit(1, fake_au());
-    unsigned index = 999;
+    StatefulSession::Frame index;
     CHECK(session.sync(1, &index) == StatefulSession::SyncStatus::ok);
 
     device.lose_device = true;
@@ -251,7 +283,7 @@ void test_finish_drains()
 
     session.submit(1, fake_au());
     device.deliver(1);
-    unsigned index = 999;
+    StatefulSession::Frame index;
     CHECK(session.sync(1, &index) == StatefulSession::SyncStatus::ok);
 
     session.submit(2, fake_au());
@@ -273,6 +305,7 @@ int main()
     test_provisioning_and_mapping();
     test_out_of_order_delivery_and_stash();
     test_drop_sequence_recycles();
+    test_stale_release_after_reprovision();
     test_timeout_drain_recovery();
     test_output_ring_growth();
     test_device_lost();

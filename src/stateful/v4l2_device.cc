@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <system_error>
@@ -243,7 +244,8 @@ unsigned V4L2StatefulDevice::request_capture_buffers(unsigned count)
 
 std::span<uint8_t> V4L2StatefulDevice::capture_plane(unsigned index, unsigned plane)
 {
-    return capture_buffers_.at(index).planes.at(plane);
+    check_capture_index(index);
+    return capture_buffers_[index].planes.at(plane);
 }
 
 void V4L2StatefulDevice::queue_output(unsigned index, uint64_t sequence, unsigned bytes_used)
@@ -287,8 +289,23 @@ std::optional<uint32_t> V4L2StatefulDevice::dequeue_output()
     return buffer.index;
 }
 
+void V4L2StatefulDevice::check_capture_index(unsigned index) const
+{
+    /* D83: a stale index (a binding surviving a CAPTURE re-provision) must
+     * fail with a message that names the bug, not a bare std::out_of_range
+     * from a container. It is not DeviceLost: the device is fine. */
+    if (index >= capture_buffers_.size()) {
+        char message[96];
+        snprintf(message, sizeof(message), "CAPTURE index %u outside the provisioned pool of %zu", index,
+            capture_buffers_.size());
+        throw std::runtime_error(message);
+    }
+}
+
 void V4L2StatefulDevice::queue_capture(unsigned index)
 {
+    check_capture_index(index);
+
     v4l2_plane planes[VIDEO_MAX_PLANES] = {};
     v4l2_buffer buffer = {
         .index = index,
@@ -297,7 +314,7 @@ void V4L2StatefulDevice::queue_capture(unsigned index)
     };
     if (V4L2_TYPE_IS_MULTIPLANAR(capture_type_)) {
         buffer.m.planes = planes;
-        buffer.length = static_cast<uint32_t>(capture_buffers_.at(index).planes.size());
+        buffer.length = static_cast<uint32_t>(capture_buffers_[index].planes.size());
     }
     if (int error = xioctl(VIDIOC_QBUF, &buffer, "VIDIOC_QBUF"); error < 0) {
         throw std::system_error(-error, std::generic_category(), "VIDIOC_QBUF(CAPTURE)");

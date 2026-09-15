@@ -68,6 +68,16 @@ public:
         dead,
     };
 
+    /* A claimed decoded frame: the CAPTURE index plus the provisioning
+     * generation it belongs to (D83). A re-provision (mid-stream
+     * SOURCE_CHANGE) increments the generation; releasing a stale binding is
+     * a logged no-op instead of a QBUF of an index the pool no longer has. */
+    struct Frame {
+        unsigned index = 0;
+        uint64_t generation = 0;
+        friend bool operator==(const Frame&, const Frame&) = default;
+    };
+
     StatefulSession(StatefulDevice& device, uint32_t coded_pixelformat, unsigned coded_width, unsigned coded_height,
         const Options& options, std::function<void(const char*)> log = {});
 
@@ -77,11 +87,12 @@ public:
 
     /* Wait (bounded) for the frame with this sequence; other frames dequeued
      * on the way are stashed. */
-    SyncStatus sync(uint64_t sequence, unsigned* capture_index);
+    SyncStatus sync(uint64_t sequence, Frame* frame);
 
     /* Return a claimed CAPTURE buffer to the queue (surface reuse/destroy,
-     * point 4). */
-    void release_frame(unsigned capture_index);
+     * point 4); a binding from a previous provisioning generation is a
+     * logged no-op. */
+    void release_frame(const Frame& frame);
 
     /* Forget a submitted-but-never-synced sequence; its frame is re-queued
      * on arrival. */
@@ -101,6 +112,9 @@ public:
     bool provisioned() const { return provisioned_.load(std::memory_order_relaxed); }
     /* Stable once provisioned; under churn read it holding hold(). */
     const CaptureFormat& capture_format() const { return capture_format_; }
+    /* Bumped by every CAPTURE provisioning; under churn read it holding
+     * hold(). */
+    uint64_t generation() const { return generation_; }
     unsigned timeout_recoveries() const { return timeout_recoveries_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     StatefulDevice& device() { return device_; }
@@ -110,13 +124,13 @@ private:
     void pump_locked();
     void handle_source_change_locked();
     void handle_capture_locked(const DequeuedCapture& frame);
-    bool claim_locked(uint64_t sequence, unsigned* capture_index);
+    bool claim_locked(uint64_t sequence, Frame* frame);
     /* Drop the lock around one device wait; exactly one thread is the
      * harvester at a time (the others sleep on the condvar). */
     void wait_for_progress(std::unique_lock<std::mutex>& lock, int timeout_ms, bool include_output);
     /* Caller owns harvesting_; true when LAST was seen. */
     bool drain_capture_locked(std::unique_lock<std::mutex>& lock, int timeout_ms);
-    SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, unsigned* capture_index);
+    SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame);
     void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
     int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
     void log(const char* message);
@@ -144,6 +158,8 @@ private:
     std::atomic<bool> dead_ { false };
     CaptureFormat capture_format_ {};
     unsigned capture_count_ = 0;
+    uint64_t generation_ = 0; /* CAPTURE provisioning generation (D83) */
+    bool stale_release_logged_ = false;
 
     std::map<uint64_t, unsigned> stash_; /* decoded, not yet claimed */
     std::set<uint64_t> unwanted_sequences_;

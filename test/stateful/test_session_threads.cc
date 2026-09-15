@@ -186,7 +186,7 @@ void test_concurrent_submit_and_sync()
     std::atomic<uint64_t> synced { 0 };
     std::mutex release_mutex;
     std::condition_variable release_cv;
-    std::deque<unsigned> to_release;
+    std::deque<StatefulSession::Frame> to_release;
     /* A real client cycles a finite surface pool; an unbounded backlog of
      * unreleased frames would starve the decoder of CAPTURE buffers. */
     constexpr size_t kMaxUnreleased = 6;
@@ -198,17 +198,17 @@ void test_concurrent_submit_and_sync()
         try {
             for (uint64_t sequence = 1; sequence <= kIterations; sequence++) {
                 for (;;) {
-                    unsigned index;
+                    StatefulSession::Frame frame;
                     {
                         std::lock_guard<std::mutex> g(release_mutex);
                         if (to_release.empty()) {
                             break;
                         }
-                        index = to_release.front();
+                        frame = to_release.front();
                         to_release.pop_front();
                     }
                     release_cv.notify_all();
-                    session.release_frame(index);
+                    session.release_frame(frame);
                 }
                 session.submit(sequence, fake_au());
             }
@@ -224,7 +224,7 @@ void test_concurrent_submit_and_sync()
      * still returns surfaces from the consuming side. */
     std::thread consumer([&] {
         try {
-            unsigned index = 0;
+            StatefulSession::Frame index;
             for (uint64_t sequence = 1; sequence <= kIterations; sequence++) {
                 if (session.sync(sequence, &index) != StatefulSession::SyncStatus::ok) {
                     failed = true;
@@ -260,16 +260,16 @@ void test_concurrent_submit_and_sync()
     /* Consistent maps at the end: release the tail claims, then every
      * CAPTURE buffer must be back on the device queue exactly once. */
     for (;;) {
-        unsigned index;
+        StatefulSession::Frame frame;
         {
             std::lock_guard<std::mutex> g(release_mutex);
             if (to_release.empty()) {
                 break;
             }
-            index = to_release.front();
+            frame = to_release.front();
             to_release.pop_front();
         }
-        session.release_frame(index);
+        session.release_frame(frame);
     }
     {
         std::lock_guard<std::mutex> g(device.m);
