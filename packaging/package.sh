@@ -12,17 +12,22 @@
 # WHY THE ENVIRONMENT IS PART OF THE PACKAGE (design VPU_DESIGN.md 7.6 point 1)
 #
 # libva's default lookup asks DRM for the kernel driver's name and loads <name>_drv_video.so. In
-# a DroidVM guest that name is `virtio_gpu`, there is no virtio_gpu_drv_video.so and there never
-# will be one -- the guest Mesa is built -Dgallium-drivers=zink,llvmpipe with no VA state tracker
-# at all -- so vaInitialize fails and every VA client falls back to software while a perfectly
-# good decoder sits on /dev/video*. The backend is named `v4l2` (upstream's name, kept so this
-# tree stays offerable upstream), so LIBVA_DRIVER_NAME=v4l2 is what connects the two. It is
-# shipped rather than documented because "export this or nothing works" is not a tuning knob.
+# a DroidVM guest that name is `virtio_gpu`, and -- B18 §2 corrects the guess this comment used
+# to make -- /usr/lib/aarch64-linux-gnu/dri/virtio_gpu_drv_video.so DOES exist: the distro Mesa
+# ships it as a symlink into libgallium. It is Gallium's virgl video driver, it has nothing to do
+# with this guest's virtio_gpu, and libva picking it is exactly why LIBVA_DRIVER_NAME=v4l2 is
+# REQUIRED rather than merely helpful -- without it vaInitialize goes to the wrong file and every
+# VA client falls back to software while a perfectly good decoder sits on /dev/video*. The
+# backend is named `v4l2` (upstream's name, kept so this tree stays offerable upstream), so
+# LIBVA_DRIVER_NAME=v4l2 is what connects the two. It is shipped rather than documented because
+# "export this or nothing works" is not a tuning knob.
 #
-# GST_VAAPI_ALL_DRIVERS=1 is for the OLD gstreamer-vaapi elements, which carry a whitelist of
-# driver vendor strings and refuse anything else (upstream README says the same). GStreamer
-# 1.28's newer `va` plugin (vah264dec) has no such list, so this line is only about not having to
-# explain a silent element-not-found to whoever reaches for vaapidecode.
+# TWO whitelist overrides, because there are two plugins and each reads its OWN variable.
+# GST_VA_ALL_DRIVERS=1 is for GStreamer 1.28's `va` plugin (vah264dec): B18 §4.4 measured it
+# logging `Unsupported driver: DroidVM libva-v4l2 (stateful virtio-media)` (gstvadisplay.c:186)
+# and registering 0 features with only the old name exported. GST_VAAPI_ALL_DRIVERS=1 is the same
+# whitelist in the OLD gstreamer-vaapi elements (vaapidecode). Both are exported: a guest may
+# carry either plugin, and a missing override reads as a missing package, not as a refusal.
 set -euo pipefail
 
 PKGVER=${1:?version}
@@ -52,14 +57,18 @@ cat > "$root/etc/profile.d/droidvm-va.sh" <<'EOF'
 # Installed by libva-v4l2 (DroidVM guest VA-API backend).
 #
 # LIBVA_DRIVER_NAME: libva's default lookup asks DRM for the kernel driver's name and loads
-# <name>_drv_video.so. Here that name is `virtio_gpu`, no virtio_gpu_drv_video.so exists (the
-# guest Mesa is built without any VA state tracker), and vaInitialize fails -- so every VA-API
-# client falls back to software with the decoder sitting unused on /dev/video*. Naming the
-# driver explicitly is what connects libva to this package.
+# <name>_drv_video.so. Here that name is `virtio_gpu`, and a virtio_gpu_drv_video.so DOES exist
+# in this guest -- the distro Mesa ships it as a symlink into libgallium -- but it is Gallium's
+# virgl video driver, not ours, and it decodes nothing here. That is precisely why this line is
+# required: left alone, libva opens the wrong driver and every VA-API client falls back to
+# software with the decoder sitting unused on /dev/video*.
 export LIBVA_DRIVER_NAME=v4l2
-# GST_VAAPI_ALL_DRIVERS: the old gstreamer-vaapi elements keep a whitelist of driver vendor
-# strings and refuse anything not on it. GStreamer 1.28's newer `va` plugin (vah264dec) does not,
-# so this only matters to whoever reaches for vaapidecode.
+# GST_VA_ALL_DRIVERS: GStreamer 1.28's `va` plugin (vah264dec) keeps its OWN vendor whitelist and
+# reads THIS variable. Without it the plugin logs `Unsupported driver: DroidVM libva-v4l2
+# (stateful virtio-media)` and registers 0 features, so vah264dec does not exist at all.
+export GST_VA_ALL_DRIVERS=1
+# GST_VAAPI_ALL_DRIVERS: the same whitelist in the OLD gstreamer-vaapi elements (vaapidecode),
+# which read the other name. Both are exported because a guest may carry either plugin.
 export GST_VAAPI_ALL_DRIVERS=1
 # LIBVA_V4L2_VIDEO_PATH=/dev/videoN pins one node if the probe picks the wrong one.
 EOF
@@ -125,9 +134,11 @@ Description: VA-API backend for DroidVM's virtio-media V4L2 decoder
  decoder. Clients that speak V4L2 M2M directly (ffmpeg h264_v4l2m2m,
  GStreamer v4l2videodec) never needed it and are unaffected.
  .
- Installs /etc/profile.d/droidvm-va.sh, which exports LIBVA_DRIVER_NAME=v4l2:
- libva would otherwise look for a driver named after the DRM device
- (virtio_gpu), which does not exist in this guest.
+ Installs /etc/profile.d/droidvm-va.sh, which exports LIBVA_DRIVER_NAME=v4l2
+ (libva would otherwise load the driver named after the DRM device,
+ virtio_gpu, which in this guest is Mesa's virgl video driver and decodes
+ nothing) plus GST_VA_ALL_DRIVERS=1 and GST_VAAPI_ALL_DRIVERS=1, the vendor
+ whitelist overrides GStreamer's two VA-API plugins each read separately.
 EOF
 
 deb="${PKG}_${PKGVER}_arm64.deb"
