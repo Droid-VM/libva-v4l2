@@ -45,8 +45,9 @@ public:
     /* drm_fd is the VA display's DRM fd (borrowed, from the driver's
      * drm_state); if < 0 the allocator opens /dev/dri/renderD128 itself and
      * owns that fd. On any failure usable() stays false and the session falls
-     * back to VA1 MMAP. */
-    explicit GbmAllocator(int drm_fd, std::function<void(const char*)> log = {});
+     * back to VA1 MMAP. `logger` may be empty -- the ctor then installs a
+     * stderr writer so log_ is never an empty std::function (D89). */
+    explicit GbmAllocator(int drm_fd, std::function<void(const char*)> logger = {});
     ~GbmAllocator() override;
 
     GbmAllocator(const GbmAllocator&) = delete;

@@ -76,7 +76,13 @@ StatefulH264Context::StatefulH264Context(DriverData* driver_data, V4L2M2MDevice&
     : Context(driver_data, device, picture_width, picture_height)
     , profile_(profile)
     , device_io_(device)
-    , allocator_(driver_data->drm_fd)
+    /* D89: pass an explicit, non-empty logger (the same stderr sink the
+     * session uses) rather than relying on the default -- the shipped r385
+     * defaulted it and then invoked an empty std::function out of the ctor.
+     * A stderr callback keeps the gbm mode/fallback lines visible under the
+     * rig's default log level, exactly where the session's own lines land. */
+    , allocator_(
+          driver_data->drm_fd, [](const char* message) { fprintf(stderr, "libva-v4l2 stateful: %s\n", message); })
     , session_(device_io_, V4L2_PIX_FMT_H264, picture_width, picture_height,
           session_options(driver_data, surface_ids, &allocator_))
     , au_builder_(profile)

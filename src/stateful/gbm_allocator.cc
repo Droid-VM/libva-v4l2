@@ -41,6 +41,17 @@ namespace {
 
     constexpr const char* kRenderNode = "/dev/dri/renderD128";
 
+    /* The logger the allocator falls back to when the caller passes none: it
+     * must never be an empty std::function. D89 (B21-accept §4): the shipped
+     * r385 constructor called an empty callback -- std::bad_function_call out
+     * of every vaCreateContext -- because it invoked the moved-from ctor
+     * parameter instead of the guarded member, and no test constructed a real
+     * GbmAllocator the way StatefulH264Context does. */
+    void default_stderr_log(const char* message)
+    {
+        fprintf(stderr, "libva-v4l2 stateful: %s\n", message);
+    }
+
 } // namespace
 
 /*
@@ -100,8 +111,13 @@ private:
     void* map_ = nullptr;
 };
 
-GbmAllocator::GbmAllocator(int drm_fd, std::function<void(const char*)> log)
-    : log_(std::move(log))
+/* The ctor parameter is named `logger`, never `log`: `log(...)` in the body
+ * MUST bind to the guarded member function GbmAllocator::log, not to a
+ * (moved-from, empty) std::function parameter. `log_` is also defaulted to a
+ * stderr writer so it is never empty even if the member guard were dropped
+ * (D89, belt and suspenders). */
+GbmAllocator::GbmAllocator(int drm_fd, std::function<void(const char*)> logger)
+    : log_(logger ? std::move(logger) : std::function<void(const char*)>(default_stderr_log))
 {
     int fd = drm_fd;
     if (fd < 0) {

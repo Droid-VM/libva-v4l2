@@ -144,6 +144,17 @@ test_gbm_surface = executable('test_gbm_surface',
 	dependencies: [ libva_dep, libdrm_dep, kernel_dep ])
 test('gbm-surface', test_gbm_surface)
 
+# D89: construct a REAL GbmAllocator the way StatefulH264Context does (one
+# argument, the default logger) and drive it through the session against the
+# scripted device -- the seam-below gbm-surface test above never builds a real
+# GbmAllocator, so it missed the empty-logger crash the shipped r385 hit at the
+# first vaCreateContext. Links the real allocator (needs libgbm).
+test_gbm_allocator = executable('test_gbm_allocator',
+	[ '../test/stateful/test_gbm_allocator.cc', 'stateful/session.cc', 'stateful/gbm_allocator.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, libdrm_dep, libgbm_dep, kernel_dep ])
+test('gbm-allocator', test_gbm_allocator)
+
 # D83: the driver-wide id->object maps read on the hot path while another
 # frame thread inserts/erases (vaCreateBuffer/vaDestroyBuffer per picture).
 # This links the whole backend and drives the real vtable entry points from
