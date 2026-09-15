@@ -390,6 +390,25 @@ bool StatefulSession::provision_capture_gbm_locked(unsigned count)
         capture_format_ = device_.capture_format(); /* re-read the negotiated geometry */
     }
 
+    /* 7.7 (2): the geometry the R8 container was sized from is the VA
+     * width/height; reconcile it with the device's negotiated G_FMT before
+     * committing to DMABUF. The stride matched (or was negotiated) above; the
+     * remaining check is that each bo actually holds the device's sizeimage --
+     * the decoder writes sizeimage bytes into the buffer, so a bo smaller than
+     * that (unusual padding/alignment, or a height that grew on re-read) would
+     * be an out-of-bounds write. On the phone the R8 container (3112960) is a
+     * touch larger than sizeimage (3110400) so this passes; a shortfall frees
+     * the bos and falls back to MMAP rather than hand the codec a short
+     * buffer. */
+    if (capture_format_.sizeimage != 0 && first->size() < capture_format_.sizeimage) {
+        char line[176];
+        snprintf(line, sizeof(line),
+            "stateful surfaces: mmap (reason: GBM container %zu < device sizeimage %u -- too small for the decoder)",
+            first->size(), capture_format_.sizeimage);
+        log(line);
+        return false;
+    }
+
     capture_bos_.clear();
     capture_bos_.reserve(count);
     capture_bos_.push_back(std::move(first));

@@ -190,6 +190,29 @@ void test_stride_refused_falls_back_to_mmap()
     CHECK_EQ(device.capture_count, 10u); /* min 4 + share 6 */
 }
 
+void test_gbm_container_too_small_falls_back_to_mmap()
+{
+    /* 7.7 (2): the stride matches (no S_FMT) but the device's G_FMT sizeimage
+     * exceeds the R8 container -- the decoder would write past the bo, so the
+     * session must free the bos and fall back to MMAP. Named mutation: drop the
+     * first->size() < sizeimage guard -> this proceeds in gbm with a short
+     * buffer. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.scripted_format.bytesperline = 1920; /* stride matches the bo */
+    /* The fake bo is stride*(height+height/2) = 1920*1632 = 3133440; ask the
+     * device for more than that. */
+    device.scripted_format.sizeimage = 4000000;
+    FakeAllocator allocator;
+    allocator.stride = 1920;
+    StatefulSession session(device, 0x34363248, 1920, 1088, gbm_options(&allocator));
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::mmap);
+    CHECK(!device.capture_dmabuf);
+    CHECK(device.capture_streaming);
+}
+
 void test_gbm_allocation_failure_falls_back()
 {
     /* A mid-pool allocation failure unwinds cleanly to MMAP. */
@@ -455,6 +478,7 @@ int main()
     test_gbm_mode_when_capable();
     test_stride_negotiated_then_gbm();
     test_stride_refused_falls_back_to_mmap();
+    test_gbm_container_too_small_falls_back_to_mmap();
     test_gbm_allocation_failure_falls_back();
     test_dmabuf_qbuf_eio_falls_back_to_mmap_and_decodes();
     test_dmabuf_qbuf_einval_also_falls_back();
