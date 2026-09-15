@@ -1,0 +1,42 @@
+# Cross-build environment for the aarch64 guest VA-API backend, driven from an x86_64 host.
+# Modelled on Droid-VM/mesa-cross's Dockerfile.mesa-cross, and deliberately the same shape:
+# Ubuntu resolute base (the DroidVM guest is Ubuntu 26.04, so the arm64 -dev libraries here are
+# the guest's own ABI) + arm64 multiarch. The amd64 side carries the build tools and the aarch64
+# cross toolchain, the arm64 side carries the target -dev libraries; compilation is native x86
+# emitting aarch64, so nothing is emulated and there is no sysroot to assemble.
+#
+# Unlike mesa this build has no llvm-config problem, so -- unlike Dockerfile.mesa-cross -- there
+# is no qemu-user here at all: not one binary of the target architecture is executed.
+ARG BASE=ubuntu:26.04
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources
+RUN rm -f /etc/apt/sources.list; \
+    dpkg --add-architecture arm64 && apt-get update
+
+# Host (amd64) build tools + the aarch64 cross toolchain. These stay NATIVE -- never :arm64.
+#
+# apt-get update in the SAME RUN as the install: with it in its own layer, editing an install line
+# reuses the cached lists while the archive has moved on and every versioned .deb URL 404s --
+# which reads like a mirror outage rather than the cache problem it is (mesa-cross learned this).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      crossbuild-essential-arm64 \
+      meson ninja-build pkgconf python3 \
+      git ca-certificates xz-utils dpkg-dev
+
+# arm64 target -dev libraries: exactly the five dependencies of the root meson.build --
+# libva, libdrm, gstreamer-codecparsers-1.0, libgstcodecs-1.0 (inside the same -bad package, not
+# advertised through pkg-config, which is why meson looks for it with find_library) and libudev.
+# libgstreamer1.0-dev comes along for gst/gst.h, which the codecparsers headers include.
+#
+# An explicit list, NOT `apt build-dep -a arm64`: this tree has no debian/control, and build-dep
+# on the Ubuntu source package would pull the archive's own idea of the dependencies.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libva-dev:arm64 \
+      libdrm-dev:arm64 \
+      libgstreamer1.0-dev:arm64 \
+      libgstreamer-plugins-bad1.0-dev:arm64 \
+      libudev-dev:arm64
+
+WORKDIR /work
