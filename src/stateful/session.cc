@@ -37,6 +37,7 @@ namespace {
     using Clock = std::chrono::steady_clock;
 
     constexpr int kDefaultSyncTimeoutMs = 500;
+    constexpr int kDefaultSyncIdleMs = 50;
     constexpr unsigned kMaxCaptureBuffers = 32;
     constexpr unsigned kPoolShareCap = 8;
     constexpr int kWaitSliceMs = 10;
@@ -54,6 +55,21 @@ namespace {
             }
         }
         return kDefaultSyncTimeoutMs;
+    }
+
+    int resolve_sync_idle(int configured)
+    {
+        if (configured >= 0) {
+            return configured;
+        }
+        if (const char* env = getenv("LIBVA_V4L2_SYNC_IDLE_MS"); env != nullptr) {
+            char* end = nullptr;
+            long value = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && value >= 0 && value <= 60000) {
+                return static_cast<int>(value);
+            }
+        }
+        return kDefaultSyncIdleMs;
     }
 
     int remaining_ms(Clock::time_point deadline)
@@ -81,6 +97,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , surface_count_(options.surface_count)
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
+    , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
     , output_pixelformat_(coded_pixelformat)
     , coded_width_(coded_width)
     , coded_height_(coded_height)
@@ -350,6 +367,7 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
         std::copy(access_unit.begin(), access_unit.end(), plane.begin());
         device_.queue_output(static_cast<unsigned>(index), sequence, access_unit.size());
         queued_outputs_ += 1;
+        submit_count_ += 1; /* D85: waiting syncs watch this for input flow */
         cv_.notify_all();
     } catch (const DeviceLost&) {
         dead_ = true;
@@ -390,7 +408,7 @@ bool StatefulSession::drain_capture_locked(std::unique_lock<std::mutex>& lock, i
 }
 
 StatefulSession::SyncStatus StatefulSession::recover_locked(
-    std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame)
+    std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame, bool idle)
 {
     /* One recovery at a time: wait out any harvester (its pump may deliver
      * our frame), then own the role for the whole stop/drain/start. */
@@ -404,14 +422,26 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
 
     SyncStatus status = SyncStatus::decode_error;
     try {
-        /* 7.6 point 5b: assume a reorder deadlock -- the decoder holds
-         * frames the client is waiting for. Drain and restart; count
-         * it (the B18 bar wants 0 on the 1080p reference clip). */
-        timeout_recoveries_ += 1;
-        char line[160];
-        snprintf(line, sizeof(line),
-            "sync timeout after %d ms on sequence %llu: DEC_CMD_STOP drain + restart (occurrence %u)", sync_timeout_ms_,
-            static_cast<unsigned long long>(sequence), timeout_recoveries_);
+        /* 7.6 point 5b: the decoder holds frames the client is waiting
+         * for. Drain and restart; count and log the two triggers apart
+         * (D85): 'idle drain' -- no new input for sync_idle_ms_, the
+         * stream tail or a genuine stall, drained fast; 'sync timeout' --
+         * input still flowing, the hard cap expired (the B18 bar wants 0
+         * of these on the 1080p reference clip). */
+        char line[192];
+        if (idle) {
+            idle_drains_ += 1;
+            snprintf(line, sizeof(line),
+                "idle drain after %d ms without new input on sequence %llu: DEC_CMD_STOP drain + restart "
+                "(occurrence %u, sync timeouts %u)",
+                sync_idle_ms_, static_cast<unsigned long long>(sequence), idle_drains_, timeout_recoveries_);
+        } else {
+            timeout_recoveries_ += 1;
+            snprintf(line, sizeof(line),
+                "sync timeout after %d ms on sequence %llu: DEC_CMD_STOP drain + restart "
+                "(occurrence %u, idle drains %u)",
+                sync_timeout_ms_, static_cast<unsigned long long>(sequence), timeout_recoveries_, idle_drains_);
+        }
         log(line);
 
         device_.decoder_stop();
@@ -441,6 +471,13 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
     }
 
     const auto deadline = Clock::now() + std::chrono::milliseconds(sync_timeout_ms_);
+    /* D85: wait while input is flowing (another thread submitted since the
+     * wait began), up to the hard cap; but once no new submission arrives
+     * for sync_idle_ms_, drain now -- the frame is either held back by the
+     * codec (the B-frame stream tail) or lost, and only a drain settles
+     * which. */
+    uint64_t submits_seen = submit_count_;
+    auto idle_since = Clock::now();
 
     try {
         while (true) {
@@ -453,11 +490,23 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
                 return SyncStatus::dead;
             }
 
-            if (Clock::now() >= deadline) {
-                return recover_locked(lock, sequence, frame);
+            const auto now = Clock::now();
+            if (submit_count_ != submits_seen) {
+                submits_seen = submit_count_;
+                idle_since = now;
+            }
+            const auto idle_deadline = idle_since + std::chrono::milliseconds(sync_idle_ms_);
+            const bool hard_expired = now >= deadline;
+            const bool idle_expired = provisioned_ && now >= idle_deadline;
+            if (hard_expired || idle_expired) {
+                return recover_locked(lock, sequence, frame, idle_expired && !hard_expired);
             }
 
-            wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+            int slice = std::min(kWaitSliceMs, remaining_ms(deadline) + 1);
+            if (provisioned_) {
+                slice = std::min(slice, remaining_ms(idle_deadline) + 1);
+            }
+            wait_for_progress(lock, slice, false);
         }
     } catch (const DeviceLost&) {
         dead_ = true;

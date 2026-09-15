@@ -29,6 +29,7 @@
  * delivery, the timeout drain, OUTPUT ring growth, and the dead session.
  */
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -263,6 +264,58 @@ void test_stale_release_after_reprovision()
     CHECK_EQ(device.free_captures.size(), free_before + 1);
 }
 
+void test_idle_drain_on_stream_tail()
+{
+    /* D85: a B-frame stream's tail is held by the codec until a drain --
+     * VA-API has no EOS call -- so B18 saw a flat 500 ms 'sync timeout' on
+     * EVERY -bf 3 run at end of stream. Once no new submission arrives for
+     * the idle budget, the sync must drain immediately instead of sitting
+     * out the hard cap, and the tail frame must come out. Named mutation
+     * this fails under: force idle_expired to false in sync() (the frame
+     * then arrives only after the 500 ms hard cap, as a 'sync timeout'). */
+    FakeDevice device;
+    device.manual_delivery = true;
+    StatefulSession::Options options;
+    options.num_surfaces = 6;
+    options.sync_timeout_ms = 500; /* the hard cap the tail must NOT wait out */
+    options.sync_idle_ms = 30;
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+    for (uint64_t sequence = 1; sequence <= 5; sequence++) {
+        session.submit(sequence, fake_au());
+    }
+    /* The codec emits the first two and holds the last three (the reorder
+     * tail). */
+    device.deliver(1);
+    device.deliver(2);
+    StatefulSession::Frame frame;
+    CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK(session.sync(2, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(session.idle_drains(), 0u);
+
+    device.on_decoder_stop = [&device]() {
+        device.deliver(3);
+        device.deliver(4);
+        device.deliver(5, /*last=*/true);
+    };
+
+    /* Sync of frame N-2 after the last submission: one idle drain within
+     * the idle budget, and the frame comes out -- not a 500 ms stall. */
+    const auto before = std::chrono::steady_clock::now();
+    CHECK(session.sync(3, &frame) == StatefulSession::SyncStatus::ok);
+    const auto elapsed_ms
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
+    CHECK(elapsed_ms < 250);
+    CHECK_EQ(session.idle_drains(), 1u);
+    CHECK_EQ(session.timeout_recoveries(), 0u);
+    CHECK_EQ(device.decoder_stops, 1u);
+
+    /* The drain harvested the rest of the tail into the stash. */
+    CHECK(session.sync(4, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK(session.sync(5, &frame) == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(session.idle_drains(), 1u);
+}
+
 void test_output_ring_growth()
 {
     FakeDevice device;
@@ -364,6 +417,7 @@ int main()
     test_capture_pool_share();
     test_stale_release_after_reprovision();
     test_timeout_drain_recovery();
+    test_idle_drain_on_stream_tail();
     test_output_ring_growth();
     test_device_lost();
     test_submit_on_dead_device_throws();

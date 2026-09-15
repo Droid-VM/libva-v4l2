@@ -68,6 +68,12 @@ public:
         unsigned output_ring_size = 8;
         /* < 0: LIBVA_V4L2_SYNC_TIMEOUT_MS or the 500 ms default (point 5b). */
         int sync_timeout_ms = -1;
+        /* D85: how long a sync waits with NO new submission arriving before
+         * draining (a B-frame stream's tail is held by the codec until a
+         * drain -- VA-API has no EOS call, so the tail can only come out
+         * this way). While input keeps flowing the sync waits up to
+         * sync_timeout_ms instead. < 0: LIBVA_V4L2_SYNC_IDLE_MS or 50. */
+        int sync_idle_ms = -1;
     };
 
     enum class SyncStatus {
@@ -124,7 +130,9 @@ public:
      * hold(). */
     uint64_t generation() const { return generation_; }
     unsigned timeout_recoveries() const { return timeout_recoveries_; }
+    unsigned idle_drains() const { return idle_drains_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
+    int sync_idle_ms() const { return sync_idle_ms_; }
     StatefulDevice& device() { return device_; }
 
 private:
@@ -138,7 +146,7 @@ private:
     void wait_for_progress(std::unique_lock<std::mutex>& lock, int timeout_ms, bool include_output);
     /* Caller owns harvesting_; true when LAST was seen. */
     bool drain_capture_locked(std::unique_lock<std::mutex>& lock, int timeout_ms);
-    SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame);
+    SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame, bool idle);
     void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
     int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
     void log(const char* message);
@@ -149,6 +157,7 @@ private:
     std::function<unsigned()> surface_count_;
     unsigned output_ring_size_;
     int sync_timeout_ms_;
+    int sync_idle_ms_;
     uint32_t output_pixelformat_;
     uint32_t coded_width_;
     uint32_t coded_height_;
@@ -173,7 +182,9 @@ private:
     std::map<uint64_t, unsigned> stash_; /* decoded, not yet claimed */
     std::set<uint64_t> unwanted_sequences_;
     std::set<unsigned> client_owned_; /* claimed CAPTURE indices */
+    uint64_t submit_count_ = 0; /* total submits; syncs watch it for input flow (D85) */
     unsigned timeout_recoveries_ = 0;
+    unsigned idle_drains_ = 0;
 };
 
 } // namespace stateful
