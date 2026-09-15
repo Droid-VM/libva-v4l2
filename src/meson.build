@@ -48,6 +48,8 @@ sources = [
 	'h264.cc',
 	'vp8.cc',
 	'stateful/h264_bitstream.cc',
+	'stateful/session.cc',
+	'stateful/v4l2_device.cc',
 ]
 
 headers = [
@@ -69,6 +71,8 @@ headers = [
 	'stateful/device.h',
 	'stateful/gsth264bitwriter_compat.h',
 	'stateful/h264_bitstream.h',
+	'stateful/session.h',
+	'stateful/v4l2_device.h',
 ]
 cpp_args = [
 	'-Wall',
@@ -107,3 +111,9 @@ test_bitstream = executable('test_h264_bitstream',
 	cpp_args: cpp_args,
 	dependencies: [ libva_dep, libgstcodecparsers_dep, kernel_dep ])
 test('h264-bitstream', test_bitstream)
+
+test_session = executable('test_stateful_session',
+	[ '../test/stateful/test_session.cc', 'stateful/session.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ kernel_dep ])
+test('stateful-session', test_session)
