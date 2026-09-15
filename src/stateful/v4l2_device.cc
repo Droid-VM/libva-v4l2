@@ -245,7 +245,9 @@ unsigned V4L2StatefulDevice::request_capture_buffers(unsigned count)
 std::span<uint8_t> V4L2StatefulDevice::capture_plane(unsigned index, unsigned plane)
 {
     check_capture_index(index);
-    return capture_buffers_[index].planes.at(plane);
+    const auto& planes = capture_buffers_[index].planes;
+    ensure_capture_plane(plane, planes.size());
+    return planes[plane];
 }
 
 void V4L2StatefulDevice::queue_output(unsigned index, uint64_t sequence, unsigned bytes_used)
@@ -294,12 +296,7 @@ void V4L2StatefulDevice::check_capture_index(unsigned index) const
     /* D83: a stale index (a binding surviving a CAPTURE re-provision) must
      * fail with a message that names the bug, not a bare std::out_of_range
      * from a container. It is not DeviceLost: the device is fine. */
-    if (index >= capture_buffers_.size()) {
-        char message[96];
-        snprintf(message, sizeof(message), "CAPTURE index %u outside the provisioned pool of %zu", index,
-            capture_buffers_.size());
-        throw std::runtime_error(message);
-    }
+    ensure_capture_index(index, capture_buffers_.size());
 }
 
 void V4L2StatefulDevice::queue_capture(unsigned index)

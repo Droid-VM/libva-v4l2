@@ -24,6 +24,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 extern "C" {
@@ -35,6 +38,35 @@ extern "C" {
 class V4L2M2MDevice;
 
 namespace stateful {
+
+/*
+ * D83: a stale CAPTURE binding -- an index that survived a re-provision, or a
+ * plane count the client never saw -- must fail with a message that names the
+ * bug, never a bare container exception (std::out_of_range "map::at" /
+ * "vector::_M_range_check") that terminates the process. These are the checked
+ * lookups the hot path uses instead of operator[]/.at(); they are free inline
+ * functions so the bound check is unit-testable without a device.
+ */
+[[noreturn]] inline void throw_capture_out_of_range(const char* what, unsigned value, std::size_t bound)
+{
+    char message[112];
+    snprintf(message, sizeof(message), "CAPTURE %s %u outside the provisioned pool of %zu", what, value, bound);
+    throw std::runtime_error(message);
+}
+
+inline void ensure_capture_index(unsigned index, std::size_t pool_size)
+{
+    if (index >= pool_size) {
+        throw_capture_out_of_range("index", index, pool_size);
+    }
+}
+
+inline void ensure_capture_plane(unsigned plane, std::size_t plane_count)
+{
+    if (plane >= plane_count) {
+        throw_capture_out_of_range("plane", plane, plane_count);
+    }
+}
 
 /* The real StatefulDevice: plain MMAP V4L2 ioctls on the M2M video node (no
  * media node, no requests -- 7.6 point 1). */

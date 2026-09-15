@@ -147,6 +147,15 @@ test_driver_maps = executable('test_driver_maps',
 	])
 test('driver-maps', test_driver_maps)
 
+# D83: the checked CAPTURE index/plane lookups that replace the container
+# operator[]/.at() in V4L2StatefulDevice (no device needed -- the bound check
+# is a free inline function).
+test_capture_index = executable('test_capture_index',
+	[ '../test/stateful/test_capture_index.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ kernel_dep ])
+test('capture-index', test_capture_index)
+
 dl_dep = cc.find_library('dl', required: false)
 
 test_probe = executable('test_driver_probe',
