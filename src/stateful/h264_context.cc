@@ -184,6 +184,15 @@ VAStatus StatefulH264Context::sync_surface(VADriverContextP va_context, Surface&
     case stateful::StatefulSession::SyncStatus::dead:
     case stateful::StatefulSession::SyncStatus::decode_error:
     default:
+        /* D88: a failed sync must leave the surface REUSABLE. If it stayed
+         * VASurfaceRendering, the client's next vaBeginPicture on this pooled
+         * surface would be rejected VA_STATUS_ERROR_SURFACE_BUSY (16) -- the
+         * cascade B19 §6.2 saw, where one dropped frame turned into dozens of
+         * "surface is in use" and a short, wrong decode. The frame was never
+         * claimed (no CAPTURE binding to release); just unbind and free the
+         * status so the surface can carry the next picture. */
+        surface.stateful_capture_index = -1;
+        surface.status = VASurfaceReady;
         error_log(va_context, "Stateful sync failed on sequence %llu\n",
             static_cast<unsigned long long>(surface.stateful_sequence));
         return VA_STATUS_ERROR_DECODING_ERROR;
