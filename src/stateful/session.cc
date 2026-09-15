@@ -25,10 +25,13 @@
 #include "session.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <system_error>
+#include <thread>
 
 namespace stateful {
 
@@ -38,6 +41,8 @@ namespace {
 
     constexpr int kDefaultSyncTimeoutMs = 500;
     constexpr int kDefaultSyncIdleMs = 50;
+    constexpr int kDefaultProvisionRetryMs = 2000;
+    constexpr int kProvisionRetryStepMs = 50;
     constexpr unsigned kMaxCaptureBuffers = 32;
     constexpr unsigned kPoolShareCap = 8;
     constexpr int kWaitSliceMs = 10;
@@ -98,6 +103,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
+    , provision_retry_ms_(options.provision_retry_ms >= 0 ? options.provision_retry_ms : kDefaultProvisionRetryMs)
     , output_pixelformat_(coded_pixelformat)
     , coded_width_(coded_width)
     , coded_height_(coded_height)
@@ -111,7 +117,12 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     device_.set_output_format(output_pixelformat_, coded_width_, coded_height_, initial_size);
     output_size_ = device_.output_buffer_size();
 
-    unsigned granted = device_.request_output_buffers(output_ring_size_);
+    /* Post-crash: a fresh client's REQBUFS/STREAMON can be refused EBUSY while
+     * the device reaps the dead client's session. Retry with a bounded backoff
+     * (D88); on exhaustion this throws and vaCreateContext fails cleanly with
+     * VA_STATUS_ERROR_OPERATION_FAILED rather than "surface is in use". */
+    unsigned granted = 0;
+    retry_provision("REQBUFS(OUTPUT)", [&] { granted = device_.request_output_buffers(output_ring_size_); });
     if (granted == 0) {
         throw std::runtime_error("no OUTPUT buffers granted");
     }
@@ -121,7 +132,44 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
         usable_outputs_.insert(i);
     }
 
-    device_.stream_output(true);
+    retry_provision("STREAMON(OUTPUT)", [&] { device_.stream_output(true); });
+}
+
+void StatefulSession::retry_provision(const char* what, const std::function<void()>& op)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(provision_retry_ms_);
+    bool logged = false;
+    for (;;) {
+        try {
+            op();
+            return;
+        } catch (const DeviceLost&) {
+            throw;
+        } catch (const std::system_error& e) {
+            if (e.code().value() != EBUSY) {
+                throw;
+            }
+            if (Clock::now() >= deadline) {
+                char line[176];
+                snprintf(line, sizeof(line),
+                    "provisioning %s still EBUSY after %d ms: the device has not released the previous client's "
+                    "session -- failing context creation",
+                    what, provision_retry_ms_);
+                log(line);
+                throw std::runtime_error(std::string(what) + ": device busy after retry budget");
+            }
+            if (!logged) {
+                logged = true;
+                char line[176];
+                snprintf(line, sizeof(line),
+                    "provisioning %s hit EBUSY (device still reaping a crashed client); retrying up to %d ms", what,
+                    provision_retry_ms_);
+                log(line);
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(std::min(kProvisionRetryStepMs, remaining_ms(deadline) + 1)));
+        }
+    }
 }
 
 void StatefulSession::log(const char* message)
@@ -215,7 +263,11 @@ void StatefulSession::handle_source_change_locked()
     const unsigned share = std::min(num_surfaces_, kPoolShareCap);
     unsigned count = std::min(min_buffers + share, kMaxCaptureBuffers);
 
-    capture_count_ = device_.request_capture_buffers(count);
+    /* Post-crash EBUSY retry (D88): the same reaping window can refuse
+     * REQBUFS(CAPTURE)/STREAMON(CAPTURE) for the first client after a crash.
+     * Retrying here (not per-picture) turns it into one clean failure of the
+     * first sync instead of a cascade of "surface is in use" per picture. */
+    retry_provision("REQBUFS(CAPTURE)", [&] { capture_count_ = device_.request_capture_buffers(count); });
     if (capture_count_ == 0) {
         throw std::runtime_error("no CAPTURE buffers granted");
     }
@@ -228,7 +280,7 @@ void StatefulSession::handle_source_change_locked()
     for (unsigned i = 0; i < capture_count_; i++) {
         device_.queue_capture(i);
     }
-    device_.stream_capture(true);
+    retry_provision("STREAMON(CAPTURE)", [&] { device_.stream_capture(true); });
     capture_streaming_ = true;
     provisioned_ = true;
     cv_.notify_all();

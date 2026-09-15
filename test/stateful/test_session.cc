@@ -366,6 +366,91 @@ void test_reenterable_recovery()
     CHECK(!session.dead());
 }
 
+void test_provision_retry_on_ebusy()
+{
+    /* Post-crash (D88): the device refuses REQBUFS/STREAMON with EBUSY while it
+     * reaps a dead client's session; the next process hits it within
+     * milliseconds (B18/B19). Provisioning must retry with a bounded backoff
+     * and, only on exhaustion, fail the context/first begin cleanly -- never
+     * turn it into "surface is in use" on individual pictures. Named mutation
+     * this fails under: drop the retry_provision wrapper (the first EBUSY
+     * throws straight out). */
+
+    /* OUTPUT REQBUFS refused twice at construction, then granted: the session
+     * constructs. */
+    {
+        FakeDevice device;
+        device.ebusy_output_provisions = 2;
+        StatefulSession::Options options = fast_options();
+        options.provision_retry_ms = 200;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        CHECK_EQ(device.output_count, 4u);
+        CHECK(device.output_streaming);
+    }
+
+    /* OUTPUT REQBUFS refused past the budget: construction fails (which
+     * vaCreateContext turns into VA_STATUS_ERROR_OPERATION_FAILED). */
+    {
+        std::vector<std::string> lines;
+        FakeDevice device;
+        device.ebusy_output_provisions = 1000000;
+        StatefulSession::Options options = fast_options();
+        options.provision_retry_ms = 40;
+        bool threw = false;
+        try {
+            StatefulSession session(
+                device, 0x34363248, 1920, 1088, options, [&lines](const char* m) { lines.emplace_back(m); });
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+        bool logged = false;
+        for (auto&& line : lines) {
+            logged = logged || line.find("still EBUSY after") != std::string::npos;
+        }
+        CHECK(logged);
+    }
+
+    /* CAPTURE REQBUFS refused twice at the first SOURCE_CHANGE, then granted:
+     * the decode goes through. */
+    {
+        FakeDevice device;
+        device.ebusy_capture_provisions = 2;
+        StatefulSession::Options options = fast_options();
+        options.provision_retry_ms = 200;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK(session.provisioned());
+        CHECK_EQ(device.capture_count, 10u);
+    }
+
+    /* CAPTURE REQBUFS refused past the budget: the first sync fails as a
+     * per-surface decode error (not "surface is in use"), the session is not
+     * dead, and no drain was issued. */
+    {
+        std::vector<std::string> lines;
+        FakeDevice device;
+        device.ebusy_capture_provisions = 1000000;
+        StatefulSession::Options options = fast_options();
+        options.provision_retry_ms = 40;
+        StatefulSession session(
+            device, 0x34363248, 1920, 1088, options, [&lines](const char* m) { lines.emplace_back(m); });
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::decode_error);
+        CHECK(!session.dead());
+        CHECK(!session.provisioned());
+        CHECK_EQ(device.decoder_stops, 0u);
+        bool logged = false;
+        for (auto&& line : lines) {
+            logged = logged || line.find("still EBUSY after") != std::string::npos;
+        }
+        CHECK(logged);
+    }
+}
+
 void test_no_drain_before_source_change()
 {
     /* D86: no timeout/idle drain may fire before the first SOURCE_CHANGE
@@ -495,6 +580,7 @@ int main()
     test_timeout_drain_recovery();
     test_idle_drain_on_stream_tail();
     test_reenterable_recovery();
+    test_provision_retry_on_ebusy();
     test_no_drain_before_source_change();
     test_output_ring_growth();
     test_device_lost();

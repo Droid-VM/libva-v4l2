@@ -74,6 +74,12 @@ public:
          * this way). While input keeps flowing the sync waits up to
          * sync_timeout_ms instead. < 0: LIBVA_V4L2_SYNC_IDLE_MS or 50. */
         int sync_idle_ms = -1;
+        /* D88/post-crash: a fresh client's REQBUFS/STREAMON can be refused
+         * EBUSY while the device is still reaping a crashed client's session
+         * (B18/B19: the next process hits it within milliseconds). Provisioning
+         * retries EBUSY with a bounded backoff for up to this long before
+         * failing the context/first begin cleanly. < 0: 2000 ms. */
+        int provision_retry_ms = -1;
     };
 
     enum class SyncStatus {
@@ -147,6 +153,10 @@ private:
     /* Caller owns harvesting_; true when LAST was seen. */
     bool drain_capture_locked(std::unique_lock<std::mutex>& lock, int timeout_ms);
     SyncStatus recover_locked(std::unique_lock<std::mutex>& lock, uint64_t sequence, Frame* frame, bool idle);
+    /* Run a provisioning device call, retrying EBUSY with a bounded backoff
+     * (post-crash: the device is still reaping a dead client). Throws
+     * std::runtime_error if the budget is exhausted; other errors propagate. */
+    void retry_provision(const char* what, const std::function<void()>& op);
     void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
     int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
     void log(const char* message);
@@ -158,6 +168,7 @@ private:
     unsigned output_ring_size_;
     int sync_timeout_ms_;
     int sync_idle_ms_;
+    int provision_retry_ms_;
     uint32_t output_pixelformat_;
     uint32_t coded_width_;
     uint32_t coded_height_;

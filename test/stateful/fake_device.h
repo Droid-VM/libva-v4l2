@@ -62,6 +62,11 @@ public:
     bool manual_delivery = false; /* when true, only deliver() produces frames */
     bool lose_device = false;
     bool fail_create_bufs = false;
+    /* Post-crash provisioning (D88): the device refuses REQBUFS this many
+     * times with EBUSY while it reaps a dead client's session, then succeeds.
+     * A huge value models a device that never releases it. */
+    int ebusy_output_provisions = 0;
+    int ebusy_capture_provisions = 0;
     /* Model a stateful decoder whose DEC_CMD_STOP seek pauses the OUTPUT
      * queue: feeding it again needs STREAMON(OUTPUT) after DEC_CMD_START
      * (D86). When set, queue_output on a paused queue fails, so a recovery
@@ -126,6 +131,10 @@ public:
     unsigned request_output_buffers(unsigned count) override
     {
         check_alive();
+        if (ebusy_output_provisions > 0) {
+            ebusy_output_provisions -= 1;
+            throw std::system_error(EBUSY, std::generic_category(), "VIDIOC_REQBUFS(OUTPUT)");
+        }
         output_count = count;
         output_memory.assign(count, std::vector<uint8_t>(output_size));
         return count;
@@ -153,6 +162,10 @@ public:
     unsigned request_capture_buffers(unsigned count) override
     {
         check_alive();
+        if (count > 0 && ebusy_capture_provisions > 0) {
+            ebusy_capture_provisions -= 1;
+            throw std::system_error(EBUSY, std::generic_category(), "VIDIOC_REQBUFS(CAPTURE)");
+        }
         capture_count = count;
         free_captures.clear();
         return count;
