@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 
 extern "C" {
@@ -36,6 +37,14 @@ extern "C" {
 }
 
 struct Buffer {
+    /* data is calloc()/reallocarray()'d, so it must be free()'d, not delete'd:
+     * a std::unique_ptr<uint8_t> would call operator delete on malloc'd memory
+     * (UB; ASan flags alloc-dealloc-mismatch, benign only because glibc's
+     * operator delete happens to call free). Carry the C free deleter. */
+    struct FreeDeleter {
+        void operator()(uint8_t* p) const { free(p); }
+    };
+
     Buffer(VABufferType type, unsigned count, unsigned size, VASurfaceID derived_surface_id);
     /* A buffer over externally owned memory (a CAPTURE buffer mmap for a
      * derived image on the stateful path); nothing is allocated or freed. */
@@ -45,7 +54,7 @@ struct Buffer {
 
     VABufferType type;
     unsigned count;
-    std::unique_ptr<uint8_t> data;
+    std::unique_ptr<uint8_t, FreeDeleter> data;
     uint8_t* external_data = nullptr;
     unsigned int size;
     VASurfaceID derived_surface_id;
