@@ -86,6 +86,12 @@ public:
      * returns the device's own bytesperline), so a bo-stride mismatch falls
      * back to MMAP. */
     bool capture_stride_negotiable = true;
+    /* D90 runtime shape: REQBUFS(CAPTURE,DMABUF) is granted but the first N
+     * DMABUF QBUFs fail -EIO (the protected guest's restricted DMA pool refuses
+     * the virtio-gpu vram exporter's map_dma_buf). errno is configurable so the
+     * EFAULT/EINVAL variants can be exercised too. */
+    int eio_dmabuf_qbufs = 0;
+    int dmabuf_qbuf_errno = EIO;
 
     /* --- observable state --- */
     struct QueuedOutput {
@@ -225,6 +231,10 @@ public:
     void queue_capture_dmabuf(unsigned index, std::span<const stateful::DmabufPlane> planes) override
     {
         check_alive();
+        if (eio_dmabuf_qbufs > 0) {
+            eio_dmabuf_qbufs -= 1;
+            throw std::system_error(dmabuf_qbuf_errno, std::generic_category(), "VIDIOC_QBUF(CAPTURE,DMABUF)");
+        }
         dmabuf_queues.push_back({ index, { planes.begin(), planes.end() } });
         free_captures.push_back(index);
     }

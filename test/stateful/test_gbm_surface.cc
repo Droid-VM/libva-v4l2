@@ -204,6 +204,50 @@ void test_gbm_allocation_failure_falls_back()
     CHECK(!device.capture_dmabuf);
 }
 
+void test_dmabuf_qbuf_eio_falls_back_to_mmap_and_decodes()
+{
+    /* D90 runtime shape: SUPPORTS_DMABUF advertised, a usable allocator,
+     * REQBUFS(CAPTURE,DMABUF) granted -- but the first DMABUF QBUF fails -EIO
+     * (the protected guest's restricted DMA pool refuses the vram exporter).
+     * The session must tear the DMABUF provisioning down and re-provision MMAP
+     * WITHOUT losing the frame (B21: Epiphany 300 -> 0). Named mutation: let
+     * the QBUF exception propagate out of provision_capture_gbm_locked (drop
+     * the try/catch) -> decode_one's sync fails, no fallback, mode stays
+     * gbm_dmabuf with a dead decode. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.eio_dmabuf_qbufs = 1; /* the first DMABUF QBUF is refused -EIO */
+    FakeAllocator allocator;
+    StatefulSession session(device, 0x34363248, 1920, 1088, gbm_options(&allocator));
+
+    /* The decode still completes, in MMAP mode. */
+    StatefulSession::Frame frame = decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::mmap);
+    CHECK(!device.capture_dmabuf); /* the DMABUF pool was released */
+    CHECK(device.capture_streaming); /* the MMAP pool is streaming */
+    CHECK_EQ(device.capture_count, 10u); /* min 4 + share 6, the MMAP pool */
+    /* A bo-backed buffer is not handed out in MMAP mode. */
+    auto guard = session.hold();
+    CHECK(session.capture_buffer(frame.index) == nullptr);
+    guard.unlock();
+    session.release_frame(frame);
+}
+
+void test_dmabuf_qbuf_einval_also_falls_back()
+{
+    /* The ladder covers EFAULT/EINVAL as well as EIO (7.7 (3)). */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.eio_dmabuf_qbufs = 1;
+    device.dmabuf_qbuf_errno = EINVAL;
+    FakeAllocator allocator;
+    StatefulSession session(device, 0x34363248, 1920, 1088, gbm_options(&allocator));
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::mmap);
+    CHECK(!device.capture_dmabuf);
+}
+
 void test_spares_when_min_exceeds_surfaces()
 {
     /* Fewer surfaces than the codec minimum: the pool is the minimum, the
@@ -398,6 +442,8 @@ int main()
     test_stride_negotiated_then_gbm();
     test_stride_refused_falls_back_to_mmap();
     test_gbm_allocation_failure_falls_back();
+    test_dmabuf_qbuf_eio_falls_back_to_mmap_and_decodes();
+    test_dmabuf_qbuf_einval_also_falls_back();
     test_spares_when_min_exceeds_surfaces();
     test_dmabuf_qbuf_single_plane();
     test_dmabuf_qbuf_two_plane_offsets();

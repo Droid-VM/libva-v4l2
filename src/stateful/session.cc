@@ -432,10 +432,47 @@ bool StatefulSession::provision_capture_gbm_locked(unsigned count)
         capture_count_, num_surfaces_, spares, std::max(device_.min_buffers_for_capture(), 1));
     log(line);
 
-    for (unsigned i = 0; i < capture_count_; i++) {
-        requeue_capture_locked(i);
+    /* RUNTIME fallback (D90): the r24 driver grants REQBUFS(CAPTURE,DMABUF)
+     * and advertises SUPPORTS_DMABUF, yet on a protected DroidVM guest the
+     * first QBUF of a virtio-gpu GBM bo fails -EIO -- every virtio device is
+     * bound to a restricted DMA pool, so the vram exporter's map_dma_buf
+     * (dma_map_resource) is refused (B21-accept §3). REQBUFS refusal was
+     * already handled above; a QBUF/STREAMON that fails here must NOT abort the
+     * decode (B21: Epiphany 300 -> 0). Tear the DMABUF provisioning down, free
+     * the bos, and return false so the caller re-provisions MMAP -- a broken
+     * zero-copy path costs zero frames. */
+    try {
+        for (unsigned i = 0; i < capture_count_; i++) {
+            requeue_capture_locked(i);
+        }
+        retry_provision("STREAMON(CAPTURE)", [&] { device_.stream_capture(true); });
+    } catch (const DeviceLost&) {
+        throw;
+    } catch (const std::exception& e) {
+        int errnum = 0;
+        if (const auto* se = dynamic_cast<const std::system_error*>(&e)) {
+            errnum = se->code().value();
+        }
+        char reason[224];
+        snprintf(reason, sizeof(reason),
+            "stateful surfaces: mmap (reason: DMABUF QBUF failed errno %d: %s) -- the zero-copy path is refused at "
+            "runtime, re-provisioning MMAP",
+            errnum, e.what());
+        log(reason);
+        if (capture_streaming_) {
+            device_.stream_capture(false);
+            capture_streaming_ = false;
+        }
+        try {
+            device_.request_capture_buffers_dmabuf(0);
+        } catch (const std::exception&) {
+            /* Best-effort release; the MMAP re-provision issues its own
+             * REQBUFS which supersedes whatever survived here. */
+        }
+        capture_bos_.clear();
+        capture_count_ = 0;
+        return false;
     }
-    retry_provision("STREAMON(CAPTURE)", [&] { device_.stream_capture(true); });
     capture_streaming_ = true;
     return true;
 }
