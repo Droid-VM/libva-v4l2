@@ -20,6 +20,17 @@
 # TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+
+# The stateful decode path (VPU_DESIGN.md 7.6 point 3) synthesises H.264
+# SPS/PPS with gsth264bitwriter, exported by libgstcodecparsers since 1.22:
+# the codecparsers dependency is required for it.
+if not libgstcodecparsers_dep.found()
+	error('gstreamer-codecparsers-1.0 is required: the stateful decode path synthesises H.264 parameter sets with gsth264bitwriter')
+endif
+if not libgstcodecparsers_dep.version().version_compare('>= 1.22')
+	error('gstreamer-codecparsers-1.0 >= 1.22 is required for gsth264bitwriter')
+endif
+
 sources = [
 	'driver.cc',
 	'config.cc',
@@ -36,6 +47,7 @@ sources = [
 	'mpeg2.cc',
 	'h264.cc',
 	'vp8.cc',
+	'stateful/h264_bitstream.cc',
 ]
 
 headers = [
@@ -54,6 +66,9 @@ headers = [
 	'mpeg2.h',
 	'h264.h',
 	'vp8.h',
+	'stateful/device.h',
+	'stateful/gsth264bitwriter_compat.h',
+	'stateful/h264_bitstream.h',
 ]
 cpp_args = [
 	'-Wall',
@@ -84,3 +99,11 @@ v4l2_drv_video = shared_module('v4l2_drv_video',
 		libudev_dep,
 		kernel_dep,
 	])
+
+# Host-side unit tests for the stateful path (VPU_DESIGN.md 7.6, host
+# verification): no device needed.
+test_bitstream = executable('test_h264_bitstream',
+	[ '../test/stateful/test_h264_bitstream.cc', 'stateful/h264_bitstream.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, libgstcodecparsers_dep, kernel_dep ])
+test('h264-bitstream', test_bitstream)
