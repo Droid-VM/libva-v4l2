@@ -42,6 +42,7 @@ extern "C" {
 
 #include <va/va.h>
 #include <va/va_backend.h>
+#include <va/va_drmcommon.h>
 }
 
 #include "buffer.h"
@@ -91,6 +92,15 @@ extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
         devices.push_back({ video_path_env.value(), media_path_env });
     }
     auto driver_data = new DriverData(devices);
+
+    /* VPU_DESIGN.md 7.7: stash the VA display's DRM fd for the stateful GBM
+     * surface allocator. libva hands it to the driver through drm_state for a
+     * DRM (or DRM render-node) display; other display types leave it -1 and
+     * the allocator opens /dev/dri/renderD128 itself. */
+    if ((context->display_type & VA_DISPLAY_MAJOR_MASK) == VA_DISPLAY_DRM && context->drm_state != nullptr) {
+        driver_data->drm_fd = static_cast<struct drm_state*>(context->drm_state)->fd;
+    }
+
     if (driver_data->devices.empty()) {
         /* No usable V4L2 decode node: fail vaInitialize cleanly. */
         error_log(context, "No usable V4L2 M2M decode device found.\n");

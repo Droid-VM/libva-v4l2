@@ -29,11 +29,13 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <span>
 #include <vector>
 
+#include "allocator.h"
 #include "device.h"
 
 namespace stateful {
@@ -80,12 +82,26 @@ public:
          * retries EBUSY with a bounded backoff for up to this long before
          * failing the context/first begin cleanly. < 0: 2000 ms. */
         int provision_retry_ms = -1;
+        /* VA3 zero-copy (7.7): when set and the device advertises
+         * V4L2_BUF_CAP_SUPPORTS_DMABUF, CAPTURE is provisioned from these GBM
+         * dma-bufs instead of device MMAP buffers, so vaExportSurfaceHandle
+         * can hand the browser a GPU-importable fd. Null (or an unusable
+         * allocator, or an r22 device that masks the cap) -> VA1 MMAP. Not
+         * owned by the session. */
+        SurfaceAllocator* allocator = nullptr;
     };
 
     enum class SyncStatus {
         ok,
         decode_error,
         dead,
+    };
+
+    /* Decided once per context at the first CAPTURE provisioning and logged on
+     * one line (7.7 point 5): gbm-dmabuf (a surface is a GBM bo) or mmap. */
+    enum class CaptureMode {
+        mmap,
+        gbm_dmabuf,
     };
 
     /* A claimed decoded frame: the CAPTURE index plus the provisioning
@@ -128,6 +144,17 @@ public:
      * driver mutex, then session mutex (destroySurfaces -> release_frame). */
     std::unique_lock<std::mutex> hold() { return std::unique_lock<std::mutex>(mutex_); }
 
+    /* The CAPTURE mode chosen at provisioning (7.7 point 5); mmap until the
+     * first SOURCE_CHANGE decides. Stable once provisioned; under churn read it
+     * holding hold(). */
+    CaptureMode capture_mode() const { return capture_mode_; }
+
+    /* The GBM buffer backing a claimed CAPTURE index (gbm-dmabuf mode), for
+     * vaExportSurfaceHandle and the vaDeriveImage/vaGetImage CPU views. Null in
+     * MMAP mode or for an out-of-range index. Call holding hold(), and while
+     * the surface's binding is still the current generation. */
+    SurfaceBuffer* capture_buffer(unsigned index);
+
     bool dead() const { return dead_.load(std::memory_order_relaxed); }
     bool provisioned() const { return provisioned_.load(std::memory_order_relaxed); }
     /* Stable once provisioned; under churn read it holding hold(). */
@@ -145,6 +172,18 @@ private:
     /* _locked members run with mutex_ held. */
     void pump_locked();
     void handle_source_change_locked();
+    /* 7.7 point 5: choose gbm-dmabuf vs mmap once, honouring the
+     * LIBVA_V4L2_SURFACES override and the SUPPORTS_DMABUF capability, and log
+     * the one-line reason. */
+    CaptureMode decide_capture_mode_locked();
+    /* Provision the CAPTURE pool in the decided mode. The gbm variant returns
+     * false when it must fall back (allocation, stride or REQBUFS refusal),
+     * having left nothing allocated, so the caller retries as mmap. */
+    void provision_capture_mmap_locked(unsigned count);
+    bool provision_capture_gbm_locked(unsigned count);
+    void release_capture_pool_locked();
+    /* QBUF one CAPTURE buffer in whichever mode is live (7.6/7.7). */
+    void requeue_capture_locked(unsigned index);
     void handle_capture_locked(const DequeuedCapture& frame);
     bool claim_locked(uint64_t sequence, Frame* frame);
     /* Drop the lock around one device wait; exactly one thread is the
@@ -165,6 +204,7 @@ private:
     std::function<void(const char*)> log_;
     unsigned num_surfaces_;
     std::function<unsigned()> surface_count_;
+    SurfaceAllocator* allocator_; /* not owned; null -> MMAP only */
     unsigned output_ring_size_;
     int sync_timeout_ms_;
     int sync_idle_ms_;
@@ -189,6 +229,13 @@ private:
     unsigned capture_count_ = 0;
     uint64_t generation_ = 0; /* CAPTURE provisioning generation (D83) */
     bool stale_release_logged_ = false;
+
+    CaptureMode capture_mode_ = CaptureMode::mmap;
+    bool capture_mode_decided_ = false;
+    /* gbm-dmabuf mode: one GBM bo per CAPTURE index (the surfaces plus any
+     * internal spares up to the codec minimum), owned for the context's life
+     * (7.7 point 2). Empty in MMAP mode. */
+    std::vector<std::unique_ptr<SurfaceBuffer>> capture_bos_;
 
     std::map<uint64_t, unsigned> stash_; /* decoded, not yet claimed */
     std::set<uint64_t> unwanted_sequences_;

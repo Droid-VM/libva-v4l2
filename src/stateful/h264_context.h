@@ -35,6 +35,7 @@ extern "C" {
 
 #include "../context.h"
 #include "../surface.h"
+#include "gbm_allocator.h"
 #include "h264_bitstream.h"
 #include "session.h"
 #include "v4l2_device.h"
@@ -74,6 +75,13 @@ public:
     /* vaDestroySurfaces / surface teardown: recycle the CAPTURE claim. */
     void release_surface(Surface& surface);
 
+    /* vaExportSurfaceHandle (7.7 point 3): in gbm-dmabuf mode fill a
+     * VADRMPRIMESurfaceDescriptor with the surface's GBM dma-buf (NV12/LINEAR,
+     * composed or separate layers); in MMAP mode there is no zero-copy buffer
+     * so return VA_STATUS_ERROR_UNIMPLEMENTED (the browser falls back to
+     * software, as VA1 did). A not-yet-synced surface returns SURFACE_BUSY. */
+    VAStatus export_surface(VADriverContextP va_context, Surface& surface, uint32_t flags, void* descriptor);
+
     /* A claimed frame's NV12 planes for the image path (copy or derive). */
     struct FrameView {
         std::span<uint8_t> luma;
@@ -95,6 +103,11 @@ public:
 private:
     VAProfile profile_;
     stateful::V4L2StatefulDevice device_io_;
+    /* Declared before session_ so it outlives it: the GBM surface allocator
+     * (7.7) the session provisions CAPTURE from in gbm-dmabuf mode. Always
+     * constructed; usable() is false on r22/no-render-node, and the session
+     * then falls back to MMAP. */
+    stateful::GbmAllocator allocator_;
     stateful::StatefulSession session_;
     /* D83: guards au_builder_ and next_sequence_ against concurrent
      * vaRenderPicture/vaEndPicture calls; never held across session waits. */

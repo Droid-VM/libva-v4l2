@@ -88,6 +88,11 @@ public:
     unsigned request_capture_buffers(unsigned count) override;
     std::span<uint8_t> capture_plane(unsigned index, unsigned plane) override;
 
+    uint32_t capture_buffer_capabilities() override;
+    uint32_t set_capture_stride(uint32_t bytesperline) override;
+    unsigned request_capture_buffers_dmabuf(unsigned count) override;
+    void queue_capture_dmabuf(unsigned index, std::span<const DmabufPlane> planes) override;
+
     void queue_output(unsigned index, uint64_t sequence, unsigned bytes_used) override;
     std::optional<uint32_t> dequeue_output() override;
     void queue_capture(unsigned index) override;
@@ -116,6 +121,10 @@ private:
     int fd_;
     v4l2_buf_type output_type_;
     v4l2_buf_type capture_type_;
+    /* MMAP (VA1) or DMABUF (VA3 gbm): DQBUF must name the CAPTURE queue's
+     * memory model, and DMABUF buffers are client-owned so they are never
+     * mmap'd here. */
+    v4l2_memory capture_memory_ = V4L2_MEMORY_MMAP;
     v4l2_format output_format_ {};
     std::vector<MappedBuffer> output_buffers_;
     std::vector<MappedBuffer> capture_buffers_;

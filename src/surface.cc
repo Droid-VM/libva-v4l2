@@ -320,20 +320,32 @@ VAStatus exportSurfaceHandle(
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
 
-    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
-    auto surface_it = driver_data->surfaces.find(surface_id);
-    if (surface_it == driver_data->surfaces.end()) {
-        return VA_STATUS_ERROR_INVALID_SURFACE;
+    /* D83 lock discipline: resolve the surface under the shared lock, then
+     * release it before the stateful export (which syncs on the device and
+     * takes the session lock itself; the lock order forbids holding the driver
+     * lock across that). ffmpeg/the browser never destroys a surface it is
+     * exporting, and destroySurfaces refuses to erase a VASurfaceRendering one,
+     * so the reference stays valid. */
+    Surface* surface_ptr;
+    {
+        std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
+        auto surface_it = driver_data->surfaces.find(surface_id);
+        if (surface_it == driver_data->surfaces.end()) {
+            return VA_STATUS_ERROR_INVALID_SURFACE;
+        }
+        surface_ptr = &surface_it->second;
     }
-    const auto& surface = surface_it->second;
+    auto& surface = *surface_ptr;
 
     if (surface.stateful_context != nullptr) {
-        /* VA1 has no zero-copy path (7.6 point 7): the virtio-media device
-         * has no VIDIOC_EXPBUF/DMABUF support. Browsers fall back to software
-         * decode on this status. */
-        return VA_STATUS_ERROR_UNIMPLEMENTED;
+        /* 7.7 point 3: in gbm-dmabuf mode return the surface's GBM dma-buf as
+         * an NV12/LINEAR descriptor; in MMAP mode there is no GPU-importable
+         * buffer and this returns VA_STATUS_ERROR_UNIMPLEMENTED, on which the
+         * browser falls back to software (the VA1 behaviour). */
+        return surface.stateful_context->export_surface(context, surface, flags, descriptor);
     }
 
+    std::shared_lock<std::shared_mutex> guard(driver_data->mutex);
     if (!surface.destination_buffer.has_value()) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }

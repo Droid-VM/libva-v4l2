@@ -25,16 +25,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       meson ninja-build pkgconf python3 \
       git ca-certificates xz-utils dpkg-dev
 
-# arm64 target -dev libraries: exactly the five dependencies of the root meson.build --
-# libva, libdrm, gstreamer-codecparsers-1.0, libgstcodecs-1.0 (inside the same -bad package, not
-# advertised through pkg-config, which is why meson looks for it with find_library) and libudev.
-# libgstreamer1.0-dev comes along for gst/gst.h, which the codecparsers headers include.
+# arm64 target -dev libraries: the dependencies of the root meson.build --
+# libva, libdrm, gbm (VPU_DESIGN.md 7.7: the stateful surface allocator makes
+# GBM bos for the zero-copy path), gstreamer-codecparsers-1.0, libgstcodecs-1.0
+# (inside the same -bad package, not advertised through pkg-config, which is why
+# meson looks for it with find_library) and libudev. libgstreamer1.0-dev comes
+# along for gst/gst.h, which the codecparsers headers include. libgbm1 is picked
+# up in the runtime Depends automatically -- it is a DT_NEEDED soname now, and
+# package.sh derives Depends from the linked sonames (no hand-edit needed).
 #
 # An explicit list, NOT `apt build-dep -a arm64`: this tree has no debian/control, and build-dep
 # on the Ubuntu source package would pull the archive's own idea of the dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libva-dev:arm64 \
       libdrm-dev:arm64 \
+      libgbm-dev:arm64 \
       libgstreamer1.0-dev:arm64 \
       libgstreamer-plugins-bad1.0-dev:arm64 \
       libudev-dev:arm64

@@ -29,6 +29,11 @@ cc = meson.get_compiler('cpp')
 
 libva_dep = dependency('libva', version : '>= 1.1.0')
 libdrm_dep = dependency('libdrm', version : '>= 2.4.52')
+# VA3 zero-copy (VPU_DESIGN.md 7.7): the stateful surface allocator makes GBM
+# bos on the VA display's render node so vaExportSurfaceHandle can hand a
+# browser a GPU-importable dma-buf. The R8 byte-container the VA3 spike proved
+# is the only guest-side allocation this stack's GPU samples correctly.
+libgbm_dep = dependency('gbm', version : '>= 21.0')
 libgstcodecparsers_dep = dependency('gstreamer-codecparsers-1.0', version : '>= 1.12', required: false)
 libgstcodecs_dep = cc.find_library('gstcodecs-1.0',  # Present but not advertised via pkgconfig.
 	has_headers: ['gst/codecs/gstvp9statefulparser.h'],

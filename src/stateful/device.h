@@ -74,6 +74,16 @@ enum class DeviceEvent {
     eos,
 };
 
+/* One plane of a V4L2_MEMORY_DMABUF CAPTURE buffer (VPU_DESIGN.md 7.7): the
+ * dma-buf fd (a GBM bo fd; the same fd may back both planes of a two-plane
+ * NV12, the r23 driver accepts that), the plane length and the byte offset of
+ * the plane inside the buffer. */
+struct DmabufPlane {
+    int fd = -1;
+    uint32_t length = 0;
+    uint32_t data_offset = 0;
+};
+
 class StatefulDevice {
 public:
     virtual ~StatefulDevice() = default;
@@ -91,6 +101,19 @@ public:
     virtual std::span<uint8_t> output_plane(unsigned index) = 0;
     virtual unsigned request_capture_buffers(unsigned count) = 0;
     virtual std::span<uint8_t> capture_plane(unsigned index, unsigned plane) = 0;
+
+    /* Zero-copy (VA3) CAPTURE path (VPU_DESIGN.md 7.7). The driver implements
+     * V4L2_MEMORY_DMABUF as a substitution the device never sees: user space
+     * reads V4L2_BUF_CAP_SUPPORTS_DMABUF in the REQBUFS(CAPTURE) capabilities
+     * (an r22 driver masks it, so the same .so falls back to MMAP), REQBUFS
+     * with memory=DMABUF, and QBUF each buffer with a per-plane m.fd. */
+    virtual uint32_t capture_buffer_capabilities() = 0; /* V4L2_BUF_CAP_* from a REQBUFS(CAPTURE) probe */
+    /* S_FMT(CAPTURE) to negotiate the luma stride to the GBM bo stride when
+     * they differ; returns the bytesperline the device granted (unchanged if
+     * it refused). */
+    virtual uint32_t set_capture_stride(uint32_t bytesperline) = 0;
+    virtual unsigned request_capture_buffers_dmabuf(unsigned count) = 0;
+    virtual void queue_capture_dmabuf(unsigned index, std::span<const DmabufPlane> planes) = 0;
 
     /* Queueing; dequeues are non-blocking. The OUTPUT timestamp carries the
      * 64-bit sequence (7.6 point 4). */

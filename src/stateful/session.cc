@@ -33,6 +33,10 @@
 #include <system_error>
 #include <thread>
 
+extern "C" {
+#include <linux/videodev2.h>
+}
+
 namespace stateful {
 
 namespace {
@@ -100,6 +104,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , log_(std::move(log))
     , num_surfaces_(options.num_surfaces)
     , surface_count_(options.surface_count)
+    , allocator_(options.allocator)
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
@@ -232,36 +237,107 @@ void StatefulSession::wait_for_progress(std::unique_lock<std::mutex>& lock, int 
     cv_.notify_all();
 }
 
+StatefulSession::CaptureMode StatefulSession::decide_capture_mode_locked()
+{
+    /* 7.7 point 5: gbm-dmabuf needs (a) a usable allocator, (b) the device's
+     * REQBUFS(CAPTURE) capabilities to carry V4L2_BUF_CAP_SUPPORTS_DMABUF (an
+     * r22 driver masks it, so the SAME .so keeps working on the r22 guest via
+     * MMAP), (c) a negotiable stride (checked in provision_capture_gbm_locked,
+     * which falls back on refusal). The rig can force either with
+     * LIBVA_V4L2_SURFACES=mmap|gbm. */
+    const char* env = getenv("LIBVA_V4L2_SURFACES");
+    const bool force_mmap = env != nullptr && std::strcmp(env, "mmap") == 0;
+
+    if (force_mmap) {
+        log("stateful surfaces: mmap (reason: LIBVA_V4L2_SURFACES=mmap)");
+        return CaptureMode::mmap;
+    }
+    if (allocator_ == nullptr || !allocator_->usable()) {
+        log("stateful surfaces: mmap (reason: no usable GBM allocator -- render node is not virtio_gpu, "
+            "or gbm_create_device failed)");
+        return CaptureMode::mmap;
+    }
+    if ((device_.capture_buffer_capabilities() & V4L2_BUF_CAP_SUPPORTS_DMABUF) == 0) {
+        log("stateful surfaces: mmap (reason: the device does not advertise SUPPORTS_DMABUF -- r22 driver)");
+        return CaptureMode::mmap;
+    }
+    return CaptureMode::gbm_dmabuf;
+}
+
+void StatefulSession::release_capture_pool_locked()
+{
+    if (capture_streaming_) {
+        device_.stream_capture(false);
+        capture_streaming_ = false;
+    }
+    if (capture_mode_ == CaptureMode::gbm_dmabuf) {
+        device_.request_capture_buffers_dmabuf(0);
+        capture_bos_.clear();
+    } else {
+        device_.request_capture_buffers(0);
+    }
+}
+
 void StatefulSession::handle_source_change_locked()
 {
     if (provisioned_) {
         /* Mid-stream resolution change: VA1 re-provisions and drops what was
-         * decoded against the old pool. */
+         * decoded against the old pool. The mode chosen for the context does
+         * not change. */
         log("mid-stream SOURCE_CHANGE: re-provisioning the CAPTURE pool, dropping stashed frames");
-        if (capture_streaming_) {
-            device_.stream_capture(false);
-            capture_streaming_ = false;
-        }
         stash_.clear();
         client_owned_.clear();
-        device_.request_capture_buffers(0);
+        release_capture_pool_locked();
         provisioned_ = false;
     }
 
-    /* 7.6 point 4: pool size = MIN_BUFFERS_FOR_CAPTURE + min(num_surfaces, 8),
-     * capped at 32; geometry from G_FMT(CAPTURE). D84: num_surfaces from
-     * vaCreateContext is 0 with modern clients, so re-read the live surface
-     * count here -- provisioning happens at the first SOURCE_CHANGE, by
-     * which time vaCreateSurfaces has made the pool. Without the share the
-     * client's held surfaces come out of the codec's own slots and the
-     * session deadlocks the way mpv did in B18. */
+    /* D84: num_surfaces from vaCreateContext is 0 with modern clients, so
+     * re-read the live surface count here -- provisioning happens at the first
+     * SOURCE_CHANGE (the first vaEndPicture submit, by which time every
+     * vaCreateSurfaces has run: 7.6 point 5b's deferral). In gbm-dmabuf mode
+     * the surfaces ARE the buffers, so the pool-share race disappears. */
     if (surface_count_) {
         num_surfaces_ = std::max(num_surfaces_, surface_count_());
     }
     capture_format_ = device_.capture_format();
+
+    if (!capture_mode_decided_) {
+        capture_mode_ = decide_capture_mode_locked();
+        capture_mode_decided_ = true;
+    }
+
     const unsigned min_buffers = std::max(device_.min_buffers_for_capture(), 1);
+
+    if (capture_mode_ == CaptureMode::gbm_dmabuf) {
+        /* 7.7 point 2: with DMABUF the client owns the buffers, so a surface
+         * is a buffer; request max(num_surfaces, codec minimum), capped at 32.
+         * When the minimum exceeds the surface count the extra bos are cheap
+         * internal spares so the codec always has its minimum. */
+        unsigned count = std::min(std::max(num_surfaces_, min_buffers), kMaxCaptureBuffers);
+        if (provision_capture_gbm_locked(count)) {
+            provisioned_ = true;
+            cv_.notify_all();
+            return;
+        }
+        /* Fell back: the allocator, stride or REQBUFS(DMABUF) refused. Redo as
+         * MMAP with the same .so; the reason was already logged. */
+        capture_mode_ = CaptureMode::mmap;
+    }
+
+    /* 7.6 point 4: pool size = MIN_BUFFERS_FOR_CAPTURE + min(num_surfaces, 8),
+     * capped at 32. Without the share the client's held surfaces come out of
+     * the codec's own slots and the session deadlocks the way mpv did in B18. */
     const unsigned share = std::min(num_surfaces_, kPoolShareCap);
     unsigned count = std::min(min_buffers + share, kMaxCaptureBuffers);
+    provision_capture_mmap_locked(count);
+    provisioned_ = true;
+    cv_.notify_all();
+}
+
+void StatefulSession::provision_capture_mmap_locked(unsigned count)
+{
+    const unsigned min_buffers = std::max(device_.min_buffers_for_capture(), 1);
+    const unsigned share = count >= min_buffers ? count - min_buffers : 0;
 
     /* Post-crash EBUSY retry (D88): the same reaping window can refuse
      * REQBUFS(CAPTURE)/STREAMON(CAPTURE) for the first client after a crash.
@@ -273,17 +349,133 @@ void StatefulSession::handle_source_change_locked()
     }
     generation_ += 1; /* D83: every binding handed out before this is stale */
 
+    /* The mode line was logged by decide_capture_mode_locked (or the gbm
+     * fallback). This is the pool line the rig's va.sh reads (D84). */
     char line[128];
     snprintf(line, sizeof(line), "CAPTURE pool: min %u + share %u = %u (surfaces %u, granted %u)", min_buffers, share,
         count, num_surfaces_, capture_count_);
     log(line);
     for (unsigned i = 0; i < capture_count_; i++) {
-        device_.queue_capture(i);
+        requeue_capture_locked(i);
     }
     retry_provision("STREAMON(CAPTURE)", [&] { device_.stream_capture(true); });
     capture_streaming_ = true;
-    provisioned_ = true;
-    cv_.notify_all();
+}
+
+bool StatefulSession::provision_capture_gbm_locked(unsigned count)
+{
+    const uint32_t width = capture_format_.width;
+    const uint32_t height = capture_format_.height;
+
+    /* Allocate the first bo to learn the stride, and negotiate it against the
+     * device's G_FMT bytesperline (7.7 point 1). The spike found them equal
+     * (1920 == 1920); a mismatch is a rare S_FMT(CAPTURE), and if the device
+     * refuses we free the bo and fall back to MMAP. */
+    uint32_t stride = 0;
+    auto first = allocator_->allocate(width, height, stride);
+    if (!first) {
+        log("stateful surfaces: mmap (reason: GBM allocation failed)");
+        return false;
+    }
+    if (stride != capture_format_.bytesperline) {
+        uint32_t granted = device_.set_capture_stride(stride);
+        if (granted != stride) {
+            char line[176];
+            snprintf(line, sizeof(line),
+                "stateful surfaces: mmap (reason: GBM stride %u != device bytesperline %u and S_FMT granted %u)",
+                stride, capture_format_.bytesperline, granted);
+            log(line);
+            return false;
+        }
+        capture_format_ = device_.capture_format(); /* re-read the negotiated geometry */
+    }
+
+    capture_bos_.clear();
+    capture_bos_.reserve(count);
+    capture_bos_.push_back(std::move(first));
+    for (unsigned i = 1; i < count; i++) {
+        uint32_t s = 0;
+        auto bo = allocator_->allocate(width, height, s);
+        if (!bo || s != stride) {
+            log("stateful surfaces: mmap (reason: a later GBM allocation failed or changed stride)");
+            capture_bos_.clear();
+            return false;
+        }
+        capture_bos_.push_back(std::move(bo));
+    }
+
+    try {
+        retry_provision(
+            "REQBUFS(CAPTURE,DMABUF)", [&] { capture_count_ = device_.request_capture_buffers_dmabuf(count); });
+    } catch (const DeviceLost&) {
+        throw;
+    } catch (const std::exception& e) {
+        char line[176];
+        snprintf(line, sizeof(line), "stateful surfaces: mmap (reason: REQBUFS(CAPTURE,DMABUF) refused: %s)", e.what());
+        log(line);
+        capture_bos_.clear();
+        return false;
+    }
+    if (capture_count_ == 0 || capture_count_ > capture_bos_.size()) {
+        log("stateful surfaces: mmap (reason: REQBUFS(CAPTURE,DMABUF) granted an unusable count)");
+        capture_bos_.clear();
+        capture_count_ = 0;
+        return false;
+    }
+    generation_ += 1; /* D83 */
+
+    const unsigned spares = capture_count_ > num_surfaces_ ? capture_count_ - num_surfaces_ : 0;
+    char line[200];
+    snprintf(line, sizeof(line),
+        "stateful surfaces: gbm-dmabuf (%s, stride %u, planes %u); CAPTURE pool: %u (surfaces %u, spares %u, min %u)",
+        allocator_->supports_nv12_linear() ? "NV12" : "R8 container", stride, capture_format_.num_planes,
+        capture_count_, num_surfaces_, spares, std::max(device_.min_buffers_for_capture(), 1));
+    log(line);
+
+    for (unsigned i = 0; i < capture_count_; i++) {
+        requeue_capture_locked(i);
+    }
+    retry_provision("STREAMON(CAPTURE)", [&] { device_.stream_capture(true); });
+    capture_streaming_ = true;
+    return true;
+}
+
+void StatefulSession::requeue_capture_locked(unsigned index)
+{
+    if (capture_mode_ != CaptureMode::gbm_dmabuf) {
+        device_.queue_capture(index);
+        return;
+    }
+
+    /* 7.7 point 2/5b: QBUF the bo as DMABUF. Plane 0 is the bo fd at offset 0;
+     * a two-plane NV12 puts the chroma plane at the SAME fd, data_offset
+     * stride*height (the r23 driver accepts one fd per plane). */
+    SurfaceBuffer* bo = capture_buffer(index);
+    if (bo == nullptr) {
+        throw std::runtime_error("gbm CAPTURE index has no bo");
+    }
+    const uint32_t stride = capture_format_.bytesperline != 0 ? capture_format_.bytesperline : capture_format_.width;
+    const uint32_t luma = stride * capture_format_.height;
+
+    DmabufPlane planes[2] = {};
+    unsigned n;
+    if (capture_format_.num_planes >= 2) {
+        planes[0] = { bo->fd(), luma, 0 };
+        planes[1] = { bo->fd(), luma / 2, luma };
+        n = 2;
+    } else {
+        planes[0] = { bo->fd(), static_cast<uint32_t>(bo->size()), 0 };
+        n = 1;
+    }
+    device_.queue_capture_dmabuf(index, std::span<const DmabufPlane>(planes, n));
+}
+
+SurfaceBuffer* StatefulSession::capture_buffer(unsigned index)
+{
+    if (capture_mode_ != CaptureMode::gbm_dmabuf || index >= capture_bos_.size()) {
+        return nullptr;
+    }
+    return capture_bos_[index].get();
 }
 
 void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
@@ -293,11 +485,11 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
     }
     if (frame.bytesused == 0 || frame.error) {
         /* An empty LAST (or erroneous) buffer carries no frame; recycle it. */
-        device_.queue_capture(frame.index);
+        requeue_capture_locked(frame.index);
         return;
     }
     if (unwanted_sequences_.erase(frame.sequence) > 0) {
-        device_.queue_capture(frame.index);
+        requeue_capture_locked(frame.index);
         return;
     }
     stash_[frame.sequence] = frame.index;
@@ -621,7 +813,7 @@ void StatefulSession::release_frame(const Frame& frame)
         return;
     }
     try {
-        device_.queue_capture(frame.index);
+        requeue_capture_locked(frame.index);
         cv_.notify_all(); /* a free CAPTURE buffer lets the decoder progress */
     } catch (const DeviceLost&) {
         dead_ = true;
@@ -646,7 +838,7 @@ void StatefulSession::drop_sequence(uint64_t sequence)
             return;
         }
         try {
-            device_.queue_capture(index);
+            requeue_capture_locked(index);
             cv_.notify_all();
         } catch (const DeviceLost&) {
             dead_ = true;
@@ -683,7 +875,11 @@ void StatefulSession::finish()
         device_.stream_output(false);
         device_.stream_capture(false);
         device_.request_output_buffers(0);
-        device_.request_capture_buffers(0);
+        if (capture_mode_ == CaptureMode::gbm_dmabuf) {
+            device_.request_capture_buffers_dmabuf(0);
+        } else {
+            device_.request_capture_buffers(0);
+        }
     } catch (const std::exception&) {
         /* The device is gone; nothing left to release. */
     }
@@ -692,6 +888,9 @@ void StatefulSession::finish()
     provisioned_ = false;
     stash_.clear();
     client_owned_.clear();
+    /* The GBM bos (and their dma-buf fds) are freed here at context teardown
+     * (7.7 point 2: owned by the surfaces until vaDestroySurfaces). */
+    capture_bos_.clear();
     free_outputs_.clear();
     usable_outputs_.clear();
     queued_outputs_ = 0;

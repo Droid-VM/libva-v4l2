@@ -33,6 +33,10 @@
 #include <system_error>
 #include <vector>
 
+extern "C" {
+#include <linux/videodev2.h>
+}
+
 #include "../../src/stateful/device.h"
 
 /*
@@ -74,6 +78,14 @@ public:
      * one-shot. */
     bool stop_pauses_output = false;
     std::function<void()> on_decoder_stop;
+    /* VA3 (7.7): the CAPTURE queue's advertised V4L2_BUF_CAP_* bits. Default
+     * carries no SUPPORTS_DMABUF, so the session picks MMAP (the r22 shape); a
+     * gbm test adds V4L2_BUF_CAP_SUPPORTS_DMABUF (the r23 shape). */
+    uint32_t capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP;
+    /* set_capture_stride: true grants the requested stride; false refuses (it
+     * returns the device's own bytesperline), so a bo-stride mismatch falls
+     * back to MMAP. */
+    bool capture_stride_negotiable = true;
 
     /* --- observable state --- */
     struct QueuedOutput {
@@ -99,6 +111,16 @@ public:
     unsigned stream_off_output_calls = 0;
     bool subscribed = false;
     std::vector<std::vector<uint8_t>> output_memory;
+
+    /* VA3 observability: the DMABUF provisioning the gbm path takes. */
+    bool capture_dmabuf = false; /* the CAPTURE queue was REQBUFS'd as DMABUF */
+    unsigned capabilities_probes = 0; /* capture_buffer_capabilities() calls */
+    unsigned set_capture_stride_calls = 0;
+    struct QueuedDmabuf {
+        unsigned index;
+        std::vector<stateful::DmabufPlane> planes;
+    };
+    std::vector<QueuedDmabuf> dmabuf_queues; /* every DMABUF QBUF, in order */
 
     /* Schedule a specific sequence to be delivered next (manual order or an
      * override of FIFO); flags LAST on the buffer. */
@@ -172,6 +194,40 @@ public:
     }
 
     std::span<uint8_t> capture_plane(unsigned, unsigned) override { return {}; }
+
+    uint32_t capture_buffer_capabilities() override
+    {
+        check_alive();
+        capabilities_probes += 1;
+        return capture_caps;
+    }
+
+    uint32_t set_capture_stride(uint32_t bytesperline) override
+    {
+        check_alive();
+        set_capture_stride_calls += 1;
+        return capture_stride_negotiable ? bytesperline : scripted_format.bytesperline;
+    }
+
+    unsigned request_capture_buffers_dmabuf(unsigned count) override
+    {
+        check_alive();
+        if (count > 0 && ebusy_capture_provisions > 0) {
+            ebusy_capture_provisions -= 1;
+            throw std::system_error(EBUSY, std::generic_category(), "VIDIOC_REQBUFS(CAPTURE,DMABUF)");
+        }
+        capture_dmabuf = count > 0;
+        capture_count = count;
+        free_captures.clear();
+        return count;
+    }
+
+    void queue_capture_dmabuf(unsigned index, std::span<const stateful::DmabufPlane> planes) override
+    {
+        check_alive();
+        dmabuf_queues.push_back({ index, { planes.begin(), planes.end() } });
+        free_captures.push_back(index);
+    }
 
     void queue_output(unsigned index, uint64_t sequence, unsigned bytes) override
     {

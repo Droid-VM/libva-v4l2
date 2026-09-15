@@ -69,6 +69,12 @@ struct DriverData {
     std::map<VABufferID, Buffer> buffers;
     std::map<VAImageID, VAImage> images;
     std::vector<V4L2M2MDevice> devices;
+    /* The VA display's DRM fd (VPU_DESIGN.md 7.7): the stateful GBM surface
+     * allocator opens a gbm_device on it so vaExportSurfaceHandle can return a
+     * GPU-importable dma-buf. -1 when the display carries no DRM fd (the
+     * allocator then falls back to opening /dev/dri/renderD128, and to VA1
+     * MMAP if that fails too). Borrowed from libva; never closed here. */
+    int drm_fd = -1;
     /*
      * D83: the id->object maps above are read on the hot decode path
      * (vaBeginPicture/vaRenderPicture/vaEndPicture/vaSyncSurface/vaDeriveImage/

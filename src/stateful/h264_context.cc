@@ -25,17 +25,24 @@
 #include "h264_context.h"
 
 #include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include <linux/videodev2.h>
+
+#include <libdrm/drm_fourcc.h>
+#include <va/va.h>
+#include <va/va_drmcommon.h>
 }
 
 #include "../driver.h"
 #include "../utils.h"
+#include "prime_descriptor.h"
 
 namespace {
 
-stateful::StatefulSession::Options session_options(DriverData* driver_data, std::span<VASurfaceID> surface_ids)
+stateful::StatefulSession::Options session_options(
+    DriverData* driver_data, std::span<VASurfaceID> surface_ids, stateful::SurfaceAllocator* allocator)
 {
     stateful::StatefulSession::Options options;
     options.num_surfaces = surface_ids.size();
@@ -46,6 +53,10 @@ stateful::StatefulSession::Options session_options(DriverData* driver_data, std:
      * because this runs under the session mutex, which must never take the
      * driver-wide mutex. */
     options.surface_count = [driver_data] { return driver_data->surface_count.load(std::memory_order_relaxed); };
+    /* 7.7: provision CAPTURE from GBM dma-bufs when the allocator is usable
+     * and the device advertises SUPPORTS_DMABUF; the session decides and logs
+     * the mode once. */
+    options.allocator = allocator;
     return options;
 }
 
@@ -65,7 +76,9 @@ StatefulH264Context::StatefulH264Context(DriverData* driver_data, V4L2M2MDevice&
     : Context(driver_data, device, picture_width, picture_height)
     , profile_(profile)
     , device_io_(device)
-    , session_(device_io_, V4L2_PIX_FMT_H264, picture_width, picture_height, session_options(driver_data, surface_ids))
+    , allocator_(driver_data->drm_fd)
+    , session_(device_io_, V4L2_PIX_FMT_H264, picture_width, picture_height,
+          session_options(driver_data, surface_ids, &allocator_))
     , au_builder_(profile)
 {
 }
@@ -226,6 +239,25 @@ std::optional<StatefulH264Context::FrameView> StatefulH264Context::frame_view(co
     view.coded_height = format.height;
 
     const size_t luma_size = static_cast<size_t>(view.pitch) * format.height;
+
+    if (session_.capture_mode() == stateful::StatefulSession::CaptureMode::gbm_dmabuf) {
+        /* 7.7 point 4: one gbm_bo_map (here, the bo's stable CPU view) covers
+         * the whole NV12 container, so derive works in both plane layouts --
+         * luma at offset 0, chroma at pitch*height. */
+        stateful::SurfaceBuffer* bo = session_.capture_buffer(index);
+        if (bo == nullptr) {
+            return std::nullopt;
+        }
+        auto whole = bo->map();
+        if (whole.size() < luma_size + luma_size / 2) {
+            return std::nullopt;
+        }
+        view.luma = whole.subspan(0, luma_size);
+        view.chroma = whole.subspan(luma_size, luma_size / 2);
+        view.contiguous = whole;
+        return view;
+    }
+
     if (format.num_planes == 1) {
         auto plane = device_io_.capture_plane(index, 0);
         if (plane.size() < luma_size + luma_size / 2) {
@@ -239,4 +271,53 @@ std::optional<StatefulH264Context::FrameView> StatefulH264Context::frame_view(co
         view.chroma = device_io_.capture_plane(index, 1);
     }
     return view;
+}
+
+VAStatus StatefulH264Context::export_surface(
+    VADriverContextP va_context, Surface& surface, uint32_t flags, void* descriptor)
+{
+    if (session_.dead()) {
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
+    /* Sync first if the client exports before syncing (7.7 acceptance: a
+     * not-yet-decoded surface must not hand out a stale buffer). */
+    if (surface.status == VASurfaceRendering) {
+        VAStatus status = sync_surface(va_context, surface);
+        if (status != VA_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+
+    auto frames_guard = session_.hold();
+
+    const bool gbm = session_.capture_mode() == stateful::StatefulSession::CaptureMode::gbm_dmabuf;
+    switch (stateful::export_gate(session_.dead(), surface.stateful_capture_index >= 0, gbm,
+        surface.stateful_capture_generation == session_.generation())) {
+    case stateful::ExportGate::dead:
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    case stateful::ExportGate::busy:
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    case stateful::ExportGate::unimplemented:
+        /* VA1 MMAP mode: no GPU-importable buffer (7.6 point 7). The browser
+         * falls back to software as it did before VA3. */
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    case stateful::ExportGate::ready:
+        break;
+    }
+
+    stateful::SurfaceBuffer* bo = session_.capture_buffer(static_cast<unsigned>(surface.stateful_capture_index));
+    if (bo == nullptr) {
+        return VA_STATUS_ERROR_SURFACE_BUSY;
+    }
+    int fd = bo->export_fd();
+    if (fd < 0) {
+        error_log(va_context, "vaExportSurfaceHandle: dup of the GBM dma-buf failed\n");
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    const auto& format = session_.capture_format();
+    const uint32_t stride = format.bytesperline != 0 ? format.bytesperline : format.width;
+    stateful::fill_nv12_prime_descriptor(static_cast<VADRMPRIMESurfaceDescriptor*>(descriptor), fd, surface.width,
+        surface.height, stride, static_cast<uint32_t>(bo->size()), flags);
+    return VA_STATUS_SUCCESS;
 }

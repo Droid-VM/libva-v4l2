@@ -236,10 +236,90 @@ unsigned V4L2StatefulDevice::request_capture_buffers(unsigned count)
     if (int error = xioctl(VIDIOC_REQBUFS, &request, "VIDIOC_REQBUFS"); error < 0) {
         throw std::system_error(-error, std::generic_category(), "VIDIOC_REQBUFS(CAPTURE)");
     }
+    capture_memory_ = V4L2_MEMORY_MMAP;
     if (request.count > 0) {
         map_buffers(capture_type_, 0, request.count, capture_buffers_);
     }
     return request.count;
+}
+
+uint32_t V4L2StatefulDevice::capture_buffer_capabilities()
+{
+    /* A REQBUFS(count=0) probe: it allocates nothing but fills the queue's
+     * V4L2_BUF_CAP_* bits (7.7 online contract). SUPPORTS_DMABUF present ->
+     * the r23 driver; masked -> the r22 driver, so the same .so uses MMAP. */
+    v4l2_requestbuffers request = { .count = 0, .type = capture_type_, .memory = V4L2_MEMORY_MMAP };
+    if (int error = xioctl(VIDIOC_REQBUFS, &request, "VIDIOC_REQBUFS"); error < 0) {
+        return 0;
+    }
+    return request.capabilities;
+}
+
+uint32_t V4L2StatefulDevice::set_capture_stride(uint32_t bytesperline)
+{
+    /* Only reached when the GBM bo stride differs from what G_FMT reported
+     * (the spike found them equal, so this is a rarely-taken negotiation).
+     * S_FMT(CAPTURE) the luma stride and read back what the device granted. */
+    v4l2_format format = { .type = capture_type_ };
+    if (int error = xioctl(VIDIOC_G_FMT, &format, "VIDIOC_G_FMT"); error < 0) {
+        return 0;
+    }
+    if (V4L2_TYPE_IS_MULTIPLANAR(capture_type_)) {
+        format.fmt.pix_mp.plane_fmt[0].bytesperline = bytesperline;
+    } else {
+        format.fmt.pix.bytesperline = bytesperline;
+    }
+    if (int error = xioctl(VIDIOC_S_FMT, &format, "VIDIOC_S_FMT"); error < 0) {
+        /* The device refused the stride; report the current one so the caller
+         * sees the mismatch and falls back to MMAP. */
+    }
+    v4l2_format granted = { .type = capture_type_ };
+    if (int error = xioctl(VIDIOC_G_FMT, &granted, "VIDIOC_G_FMT"); error < 0) {
+        return 0;
+    }
+    return V4L2_TYPE_IS_MULTIPLANAR(capture_type_) ? granted.fmt.pix_mp.plane_fmt[0].bytesperline
+                                                   : granted.fmt.pix.bytesperline;
+}
+
+unsigned V4L2StatefulDevice::request_capture_buffers_dmabuf(unsigned count)
+{
+    /* DMABUF buffers are client-owned (the GBM bos), so nothing is mmap'd
+     * here; the CAPTURE queue just records how many indices exist. */
+    unmap_buffers(capture_buffers_);
+    v4l2_requestbuffers request = { .count = count, .type = capture_type_, .memory = V4L2_MEMORY_DMABUF };
+    if (int error = xioctl(VIDIOC_REQBUFS, &request, "VIDIOC_REQBUFS"); error < 0) {
+        throw std::system_error(-error, std::generic_category(), "VIDIOC_REQBUFS(CAPTURE,DMABUF)");
+    }
+    capture_memory_ = V4L2_MEMORY_DMABUF;
+    capture_buffers_.assign(request.count, MappedBuffer {});
+    return request.count;
+}
+
+void V4L2StatefulDevice::queue_capture_dmabuf(unsigned index, std::span<const DmabufPlane> planes)
+{
+    check_capture_index(index);
+
+    v4l2_plane v4l2_planes[VIDEO_MAX_PLANES] = {};
+    v4l2_buffer buffer = {
+        .index = index,
+        .type = capture_type_,
+        .memory = V4L2_MEMORY_DMABUF,
+    };
+    if (V4L2_TYPE_IS_MULTIPLANAR(capture_type_)) {
+        for (unsigned i = 0; i < planes.size() && i < VIDEO_MAX_PLANES; i++) {
+            v4l2_planes[i].m.fd = planes[i].fd;
+            v4l2_planes[i].length = planes[i].length;
+            v4l2_planes[i].data_offset = planes[i].data_offset;
+        }
+        buffer.m.planes = v4l2_planes;
+        buffer.length = static_cast<uint32_t>(planes.size());
+    } else if (!planes.empty()) {
+        buffer.m.fd = planes[0].fd;
+        buffer.length = planes[0].length;
+    }
+    if (int error = xioctl(VIDIOC_QBUF, &buffer, "VIDIOC_QBUF"); error < 0) {
+        throw std::system_error(-error, std::generic_category(), "VIDIOC_QBUF(CAPTURE,DMABUF)");
+    }
 }
 
 std::span<uint8_t> V4L2StatefulDevice::capture_plane(unsigned index, unsigned plane)
@@ -323,7 +403,7 @@ std::optional<DequeuedCapture> V4L2StatefulDevice::dequeue_capture()
     v4l2_plane planes[VIDEO_MAX_PLANES] = {};
     v4l2_buffer buffer = {
         .type = capture_type_,
-        .memory = V4L2_MEMORY_MMAP,
+        .memory = capture_memory_,
     };
     if (V4L2_TYPE_IS_MULTIPLANAR(capture_type_)) {
         buffer.m.planes = planes;

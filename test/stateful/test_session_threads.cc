@@ -164,6 +164,26 @@ public:
         std::lock_guard<std::mutex> g(m);
         return inner.wait(timeout_ms, include_output);
     }
+    uint32_t capture_buffer_capabilities() override
+    {
+        std::lock_guard<std::mutex> g(m);
+        return inner.capture_buffer_capabilities();
+    }
+    uint32_t set_capture_stride(uint32_t bytesperline) override
+    {
+        std::lock_guard<std::mutex> g(m);
+        return inner.set_capture_stride(bytesperline);
+    }
+    unsigned request_capture_buffers_dmabuf(unsigned count) override
+    {
+        std::lock_guard<std::mutex> g(m);
+        return inner.request_capture_buffers_dmabuf(count);
+    }
+    void queue_capture_dmabuf(unsigned index, std::span<const stateful::DmabufPlane> planes) override
+    {
+        std::lock_guard<std::mutex> g(m);
+        inner.queue_capture_dmabuf(index, planes);
+    }
 };
 
 std::vector<uint8_t> fake_au(size_t size = 512)

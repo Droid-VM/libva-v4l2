@@ -51,6 +51,7 @@ sources = [
 	'stateful/session.cc',
 	'stateful/v4l2_device.cc',
 	'stateful/h264_context.cc',
+	'stateful/gbm_allocator.cc',
 ]
 
 headers = [
@@ -75,6 +76,9 @@ headers = [
 	'stateful/session.h',
 	'stateful/v4l2_device.h',
 	'stateful/h264_context.h',
+	'stateful/allocator.h',
+	'stateful/gbm_allocator.h',
+	'stateful/prime_descriptor.h',
 ]
 cpp_args = [
 	'-Wall',
@@ -100,6 +104,7 @@ v4l2_drv_video = shared_module('v4l2_drv_video',
 	dependencies: [
 		libva_dep,
 		libdrm_dep,
+		libgbm_dep,
 		libgstcodecparsers_dep,
 		libgstcodecs_dep,
 		libudev_dep,
@@ -139,6 +144,7 @@ test_driver_maps = executable('test_driver_maps',
 	dependencies: [
 		libva_dep,
 		libdrm_dep,
+		libgbm_dep,
 		libgstcodecparsers_dep,
 		libgstcodecs_dep,
 		libudev_dep,
