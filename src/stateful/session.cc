@@ -50,6 +50,10 @@ namespace {
     constexpr unsigned kMaxCaptureBuffers = 32;
     constexpr unsigned kPoolShareCap = 8;
     constexpr int kWaitSliceMs = 10;
+    /* VA3-fakeau SPIKE: cap padding-AU injections per single stalled sync. One
+     * flushes a 1-frame pipeline delay; the small headroom tolerates a deeper
+     * hold without letting a genuinely-lost frame spin injecting forever. */
+    constexpr unsigned kMaxFakeInjectionsPerSync = 4;
 
     int resolve_sync_timeout(int configured)
     {
@@ -109,6 +113,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
     , allow_midstream_drain_(options.allow_midstream_drain)
+    , fake_au_injection_(options.fake_au_injection)
     , provision_retry_ms_(options.provision_retry_ms >= 0 ? options.provision_retry_ms : kDefaultProvisionRetryMs)
     , output_pixelformat_(coded_pixelformat)
     , coded_width_(coded_width)
@@ -654,6 +659,21 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
         requeue_capture_locked(frame.index);
         return;
     }
+    if (fake_au_injection_ && frame.sequence >= kFakeAuSequenceBase) {
+        /* VA3-fakeau SPIKE: the decoded output of an injected padding AU. The
+         * client never submitted this sequence, so drop it (recycle the buffer)
+         * and never stash it. It advanced the codec's pipeline; its pixels are
+         * discarded. */
+        fake_au_dropped_ += 1;
+        if (trace_) {
+            char line[128];
+            snprintf(line, sizeof(line), "TRACE FAKE-AU-DROP seq=%llu idx=%u dropped=%u",
+                static_cast<unsigned long long>(frame.sequence), frame.index, fake_au_dropped_);
+            log(line);
+        }
+        requeue_capture_locked(frame.index);
+        return;
+    }
     if (unwanted_sequences_.erase(frame.sequence) > 0) {
         requeue_capture_locked(frame.index);
         return;
@@ -761,6 +781,46 @@ void StatefulSession::grow_output_buffers_locked(std::unique_lock<std::mutex>& l
     device_.stream_output(true);
 }
 
+bool StatefulSession::inject_fake_au_locked(std::unique_lock<std::mutex>& lock)
+{
+    /* VA3-fakeau SPIKE. The caller has established the wedge: input-starved
+     * (queued_outputs_ == 0), provisioned, the awaited frame not produced. Feed
+     * the codec one more access unit -- a byte copy of the last real AU -- under
+     * a reserved sentinel sequence, so its pipeline advances by one and the held
+     * real frame is emitted (tagged with its real sequence -> stashed and
+     * delivered), while this injected AU's own output arrives tagged with the
+     * sentinel and is dropped by handle_capture_locked. 关卡二: the duplicate
+     * decodes into the DPB against a DPB that has moved on since the original,
+     * which may corrupt the references the following real frames read -- the
+     * bit-exactness check is the verdict. */
+    if (last_au_bytes_.empty()) {
+        return false;
+    }
+    int index = acquire_output_buffer_locked(lock, last_au_bytes_.size());
+    if (index < 0) {
+        return false;
+    }
+    auto plane = device_.output_plane(static_cast<unsigned>(index));
+    if (plane.size() < last_au_bytes_.size()) {
+        return false;
+    }
+    std::copy(last_au_bytes_.begin(), last_au_bytes_.end(), plane.begin());
+    const uint64_t seq = fake_au_next_seq_++;
+    /* Deliberately NOT counted in submit_count_: a fake AU is not client input
+     * flow, so a coupled sync must not read it as "the client is still feeding". */
+    device_.queue_output(static_cast<unsigned>(index), seq, last_au_bytes_.size());
+    queued_outputs_ += 1;
+    fake_au_injected_ += 1;
+    if (trace_) {
+        char line[160];
+        snprintf(line, sizeof(line), "TRACE FAKE-AU-INJECT seq=%llu bytes=%zu qout=%u injected=%u",
+            static_cast<unsigned long long>(seq), last_au_bytes_.size(), queued_outputs_, fake_au_injected_);
+        log(line);
+    }
+    cv_.notify_all();
+    return true;
+}
+
 void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_unit)
 {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -785,6 +845,11 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
         device_.queue_output(static_cast<unsigned>(index), sequence, access_unit.size());
         queued_outputs_ += 1;
         submit_count_ += 1; /* D85: waiting syncs watch this for input flow */
+        if (fake_au_injection_) {
+            /* VA3-fakeau SPIKE: remember this real AU's bytes; a later stalled
+             * sync re-submits a copy of it to flush the codec's held frame. */
+            last_au_bytes_.assign(access_unit.begin(), access_unit.end());
+        }
         if (trace_) {
             char line[128];
             snprintf(line, sizeof(line), "TRACE SUBMIT seq=%llu qout=%u free_out=%zu submits=%llu",
@@ -929,6 +994,7 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
     uint64_t submits_seen = submit_count_;
     auto idle_since = Clock::now();
     bool logged_wait = false;
+    unsigned fakes_this_sync = 0; /* VA3-fakeau SPIKE injection budget */
 
     try {
         while (true) {
@@ -969,6 +1035,22 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             const bool idle_expired = now >= idle_deadline;
             if (hard_expired || idle_expired) {
                 if (!allow_midstream_drain_) {
+                    /* VA3-fakeau SPIKE: try to flush the codec's held
+                     * output-pipeline frame before giving up. Only when
+                     * input-starved (queued_outputs_ == 0: every real AU
+                     * consumed, the awaited frame held for one more input the
+                     * coupled client will not send), bounded per sync. Injecting
+                     * feeds a padding AU; the loop then waits for the flushed
+                     * real frame and claims it. The padding AU's own output is
+                     * dropped by its sentinel tag. Disabled by default; only the
+                     * AV1 context with LIBVA_V4L2_FAKE_AU reaches here. */
+                    if (fake_au_injection_ && provisioned_ && queued_outputs_ == 0
+                        && fakes_this_sync < kMaxFakeInjectionsPerSync && inject_fake_au_locked(lock)) {
+                        fakes_this_sync += 1;
+                        idle_since = Clock::now(); /* let the codec emit the flushed frame */
+                        submits_seen = submit_count_;
+                        continue;
+                    }
                     /* VP9 and AV1 (VA3-sync-reorder). VP9's display order is
                      * in-band (show_existing_frame) so the decoder emits
                      * displayable frames with no held tail -- solid 300/300 incl.

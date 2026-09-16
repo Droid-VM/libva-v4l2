@@ -77,6 +77,12 @@ public:
      * that does not resume OUTPUT starves the next decode -- the B18
      * one-shot. */
     bool stop_pauses_output = false;
+    /* VA3-fakeau/VA3-sync-reorder: model the QTI deep-B output-pipeline tail.
+     * The codec consumes each queued AU's bitstream immediately (returns the
+     * OUTPUT buffer) but emits the decoded frame for AU K only once AU K+1 has
+     * been fed -- it always holds back the most-recently-fed AU. A single feed
+     * then stalls forever; an extra (padding) AU flushes the held frame. */
+    bool pipeline_delay = false;
     std::function<void()> on_decoder_stop;
     /* VA3 (7.7): the CAPTURE queue's advertised V4L2_BUF_CAP_* bits. Default
      * carries no SUPPORTS_DMABUF, so the session picks MMAP (the r22 shape); a
@@ -374,6 +380,29 @@ private:
      * decoded frame, in FIFO order unless a delivery order was scripted. */
     void try_decode()
     {
+        if (pipeline_delay) {
+            /* Consume every queued AU's bitstream (return its OUTPUT buffer) and
+             * move it into the internal decode pipeline; emit frames in decode
+             * order but always hold back the most-recently-fed AU. */
+            while (!pending_decodes.empty()) {
+                completed_outputs.push_back(pending_decodes.front().index);
+                pipeline_.push_back(pending_decodes.front().sequence);
+                pending_decodes.pop_front();
+            }
+            while (pipeline_.size() > 1 && !free_captures.empty()) {
+                uint64_t sequence = pipeline_.front();
+                pipeline_.pop_front();
+                stateful::DequeuedCapture frame;
+                frame.index = free_captures.front();
+                free_captures.pop_front();
+                frame.sequence = sequence;
+                frame.bytesused = scripted_format.sizeimage;
+                frame.last = is_last(sequence);
+                ready_captures.push_back(frame);
+            }
+            return;
+        }
+
         if (deliver_empty_last_ && !free_captures.empty()) {
             deliver_empty_last_ = false;
             stateful::DequeuedCapture frame;
@@ -422,4 +451,5 @@ private:
 
     std::vector<uint64_t> last_sequences_;
     bool deliver_empty_last_ = false;
+    std::deque<uint64_t> pipeline_; /* pipeline_delay: AUs consumed, frame held */
 };

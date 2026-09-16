@@ -67,6 +67,21 @@ public:
          * mutex held: it must not take the driver-wide mutex (read an
          * atomic counter instead). */
         std::function<unsigned()> surface_count;
+        /* VA3-fakeau SPIKE (env LIBVA_V4L2_FAKE_AU, default off): only the AV1
+         * context sets this, and only when the env flag is present. When true,
+         * a mid-stream sync that stalls input-starved (the deep-B AV1 reorder
+         * wedge: the QTI decoder holds decoded frame K until fed AU K+1, and a
+         * single-threaded display-order VA-API client cannot feed ahead --
+         * VA3-sync-reorder) INJECTS a copy of the most-recently-submitted real
+         * access unit, tagged with a reserved sentinel sequence, to advance the
+         * codec's output pipeline by one and flush the held frame; the injected
+         * AU's own CAPTURE output is recognised by its sentinel tag and dropped.
+         * This is a corruption-risk spike: the duplicate frame decodes into the
+         * DPB, so 关卡二 (does the injected AU corrupt the subsequent real
+         * frames' references) is the make-or-break question, settled by a
+         * bit-exactness check against software dav1d. Left false for H.264/VP9,
+         * whose sessions never construct with it and so are bit-identical. */
+        bool fake_au_injection = false;
         unsigned output_ring_size = 8;
         /* < 0: LIBVA_V4L2_SYNC_TIMEOUT_MS or the 500 ms default (point 5b). */
         int sync_timeout_ms = -1;
@@ -184,6 +199,11 @@ public:
     uint64_t generation() const { return generation_; }
     unsigned timeout_recoveries() const { return timeout_recoveries_; }
     unsigned idle_drains() const { return idle_drains_; }
+    /* VA3-fakeau SPIKE: how many sentinel padding AUs were injected, and how
+     * many of their CAPTURE outputs were recognised and dropped. Both stay 0
+     * unless LIBVA_V4L2_FAKE_AU is set AND a mid-stream AV1 sync stalled. */
+    unsigned fake_au_injected() const { return fake_au_injected_; }
+    unsigned fake_au_dropped() const { return fake_au_dropped_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     int sync_idle_ms() const { return sync_idle_ms_; }
     bool allow_midstream_drain() const { return allow_midstream_drain_; }
@@ -219,6 +239,10 @@ private:
     void retry_provision(const char* what, const std::function<void()>& op);
     void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
     int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
+    /* VA3-fakeau SPIKE: copy the buffered last real AU into a free OUTPUT
+     * buffer and queue it under a fresh sentinel sequence; true if one was
+     * injected. No-op (returns false) when disabled or nothing is buffered. */
+    bool inject_fake_au_locked(std::unique_lock<std::mutex>& lock);
     void log(const char* message);
 
     StatefulDevice& device_;
@@ -230,6 +254,7 @@ private:
     int sync_timeout_ms_;
     int sync_idle_ms_;
     bool allow_midstream_drain_;
+    bool fake_au_injection_; /* VA3-fakeau SPIKE (AV1 + LIBVA_V4L2_FAKE_AU only) */
     int provision_retry_ms_;
     uint32_t output_pixelformat_;
     uint32_t coded_width_;
@@ -273,6 +298,16 @@ private:
     bool trace_ = false;
     uint64_t delivered_ = 0; /* successful claims */
     void trace_dump_locked(const char* tag, uint64_t await);
+
+    /* VA3-fakeau SPIKE. Sentinel sequences are reserved at 1e9 and up -- far
+     * above any real per-context sequence (one per decoded picture from 1), so
+     * a CAPTURE frame tagged >= kFakeAuSequenceBase is an injected padding AU's
+     * output and is dropped, never delivered. */
+    static constexpr uint64_t kFakeAuSequenceBase = 1000000000ULL;
+    std::vector<uint8_t> last_au_bytes_; /* copy of the last real AU, for injection */
+    uint64_t fake_au_next_seq_ = kFakeAuSequenceBase;
+    unsigned fake_au_injected_ = 0;
+    unsigned fake_au_dropped_ = 0;
 };
 
 } // namespace stateful
