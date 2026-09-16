@@ -963,7 +963,7 @@ void Av1AccessUnitBuilder::build_sequence_header(const VADecPictureParameterBuff
     s.film_grain_params_present = pic.seq_info_fields.fields.film_grain_params_present;
 }
 
-void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferAV1& pic)
+void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags)
 {
     const GstAV1SequenceHeaderOBU& s = seq_;
     GstAV1FrameHeaderOBU& f = frame_;
@@ -1038,9 +1038,11 @@ void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferA
         f.ref_order_hint[i] = dpb_.slots[i].order_hint;
     }
 
-    /* refresh_frame_flags is not carried by VA; choose a self-consistent mask
-     * (see update_dpb) unless this is a shown key frame (implied 0xFF). */
-    f.refresh_frame_flags = (frame_type == AV1_KEY_FRAME && f.show_frame) ? 0xFF : choose_refresh_flags(pic);
+    /* refresh_frame_flags is not carried by VA; the caller supplies the mask it
+     * chose (an immediate heuristic, or the VA2c one-frame-lookahead
+     * reconstruction). A shown key frame implies 0xFF regardless. */
+    f.refresh_frame_flags
+        = (frame_type == AV1_KEY_FRAME && f.show_frame) ? static_cast<uint8_t>(0xFF) : refresh_frame_flags;
 
     /* Quantization. */
     GstAV1QuantizationParams& q = f.quantization_params;
@@ -1376,36 +1378,30 @@ void Av1AccessUnitBuilder::update_dpb(const VADecPictureParameterBufferAV1& pic)
     }
 }
 
-std::vector<uint8_t> Av1AccessUnitBuilder::finish()
+std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParameterBufferAV1& pic,
+    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags)
 {
-    std::vector<uint8_t> au;
-    if (!has_picture_) {
-        reset_picture();
-        return au;
-    }
-
-    if (picture_.seg_info.segment_info_fields.bits.enabled) {
-        reset_picture();
+    if (pic.seg_info.segment_info_fields.bits.enabled) {
         throw std::runtime_error("AV1 segmentation is not supported by the GStreamer bit writer (VA2b limitation)");
     }
 
-    const unsigned frame_type = picture_.pic_info_fields.bits.frame_type;
+    const unsigned frame_type = pic.pic_info_fields.bits.frame_type;
     const bool is_key = (frame_type == AV1_KEY_FRAME);
 
     /* (Re)build the sequence header on the first frame / on a key frame. */
     if (!have_sequence_ || is_key) {
-        build_sequence_header(picture_);
+        build_sequence_header(pic);
         have_sequence_ = true;
     }
-    build_frame_header(picture_);
+    build_frame_header(pic, refresh_frame_flags);
 
     /* temporal_delimiter OBU. */
-    au = write_gst_obu(
-        [](guint8* data, guint* size) { return gst_av1_bit_writer_temporal_delimiter_obu(TRUE, data, size); });
+    std::vector<uint8_t> au = write_gst_obu(
+        [](guint8* d, guint* size) { return gst_av1_bit_writer_temporal_delimiter_obu(TRUE, d, size); });
 
     /* sequence_header OBU: emit on change (deduped like the H.264 SPS). */
     std::vector<uint8_t> seq_obu = write_gst_obu(
-        [&](guint8* data, guint* size) { return gst_av1_bit_writer_sequence_header_obu(&seq_, TRUE, data, size); });
+        [&](guint8* d, guint* size) { return gst_av1_bit_writer_sequence_header_obu(&seq_, TRUE, d, size); });
     if (seq_obu != last_emitted_sequence_header_) {
         au.insert(au.end(), seq_obu.begin(), seq_obu.end());
         last_emitted_sequence_header_ = seq_obu;
@@ -1418,14 +1414,155 @@ std::vector<uint8_t> Av1AccessUnitBuilder::finish()
     au.insert(au.end(), frame_obu.begin(), frame_obu.end());
 
     /* tile_group OBU (hand-wrapped). */
-    std::vector<uint8_t> tg_payload = build_tile_group_payload(tile_params_, tile_data_, frame_.tile_info.tile_cols,
-        frame_.tile_info.tile_rows, frame_.tile_info.tile_size_bytes);
+    std::vector<uint8_t> tg_payload = build_tile_group_payload(
+        tiles, data, frame_.tile_info.tile_cols, frame_.tile_info.tile_rows, frame_.tile_info.tile_size_bytes);
     std::vector<uint8_t> tg_obu = wrap_obu(GST_AV1_OBU_TILE_GROUP, tg_payload);
     au.insert(au.end(), tg_obu.begin(), tg_obu.end());
 
+    return au;
+}
+
+std::vector<uint8_t> Av1AccessUnitBuilder::finish()
+{
+    if (!has_picture_) {
+        reset_picture();
+        return {};
+    }
+
+    const unsigned frame_type = picture_.pic_info_fields.bits.frame_type;
+    const bool shown_key = (frame_type == AV1_KEY_FRAME) && picture_.pic_info_fields.bits.show_frame;
+    const uint8_t refresh = shown_key ? static_cast<uint8_t>(0xFF) : choose_refresh_flags(picture_);
+
+    std::vector<uint8_t> au;
+    try {
+        au = assemble_au(picture_, tile_params_, tile_data_, refresh);
+    } catch (...) {
+        reset_picture();
+        throw;
+    }
     update_dpb(picture_);
     reset_picture();
     return au;
+}
+
+bool Av1AccessUnitBuilder::refresh_is_ambiguous(const VADecPictureParameterBufferAV1& pic) const
+{
+    auto in_map = [&](VASurfaceID id) {
+        for (int j = 0; j < GST_AV1_NUM_REF_FRAMES; j++) {
+            if (pic.ref_frame_map[j] == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+    /* A dead / empty slot means the immediate heuristic refreshes only dead
+     * slots -- it never evicts a live surface and never diverges destructively
+     * from the encoder's DPB, so refresh_frame_flags is unambiguous. This is the
+     * low-delay / P-frame case (the DPB always keeps a dead slot) and the frames
+     * before the DPB first fills. */
+    for (int j = 0; j < GST_AV1_NUM_REF_FRAMES; j++) {
+        if (!dpb_.slots[j].valid || !in_map(dpb_.slots[j].surface)) {
+            return false;
+        }
+    }
+    /* The DPB is full of live surfaces: storing this frame forces the eviction
+     * of a live slot, and VA does not say which. Any immediate guess diverges
+     * from the encoder's DPB, and once a few frames have guessed, our slot
+     * assignments drift until a still-live reference (e.g. the GOP key frame)
+     * is overwritten and a later frame cannot resolve it (the random-access /
+     * deep-B-pyramid failure). Defer for the one-frame lookahead, which recovers
+     * the exact refresh_frame_flags and keeps our DPB identical to the
+     * encoder's. */
+    return true;
+}
+
+uint8_t Av1AccessUnitBuilder::reconstruct_refresh_flags(
+    const VADecPictureParameterBufferAV1& held, const VASurfaceID next_ref_frame_map[8]) const
+{
+    /* Frame N wrote itself into exactly the slots that hold its own surface in
+     * frame N+1's pre-decode ref_frame_map but did not in N's own (5.9.2 /
+     * decode_frame_wrapup): RefFrameMap[i] = current_frame for the refreshed i,
+     * unchanged otherwise. N and N+1 are consecutive in decode order, so N+1's
+     * map is exactly N's map with N's refreshes applied. */
+    const VASurfaceID self = held.current_frame;
+    uint8_t mask = 0;
+    for (int i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
+        const bool now_self = (next_ref_frame_map[i] == self);
+        const bool was_self = (held.ref_frame_map[i] == self);
+        if (now_self && !was_self) {
+            mask |= static_cast<uint8_t>(1u << i);
+        }
+    }
+    return mask;
+}
+
+Av1AccessUnitBuilder::PictureResult Av1AccessUnitBuilder::submit_picture(uint64_t tag)
+{
+    PictureResult result;
+
+    /* 1. A frame held for the lookahead: this frame's ref_frame_map is the DPB
+     * after the held frame updated it, so it pins down what the held frame
+     * refreshed. Build and release it before touching the current frame so it is
+     * never lost (even if the current frame fails). */
+    if (pending_) {
+        const uint8_t refresh = has_picture_ ? reconstruct_refresh_flags(pending_->pic, picture_.ref_frame_map)
+                                             : choose_refresh_flags(pending_->pic); /* no successor: best effort */
+        std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
+        update_dpb(pending_->pic);
+        result.ready.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
+        pending_.reset();
+    }
+
+    if (!has_picture_) {
+        return result;
+    }
+
+    /* 2. The current frame. */
+    if (picture_.seg_info.segment_info_fields.bits.enabled) {
+        reset_picture();
+        result.current_failed = true;
+        return result;
+    }
+
+    const unsigned frame_type = picture_.pic_info_fields.bits.frame_type;
+    const bool is_key = (frame_type == AV1_KEY_FRAME);
+
+    if (!is_key && refresh_is_ambiguous(picture_)) {
+        /* Hold it: its refresh_frame_flags cannot be chosen without the next
+         * frame's ref_frame_map. Its surface is already bound to `tag`. */
+        PendingFrame pf;
+        pf.pic = picture_;
+        pf.tiles.assign(tile_params_.begin(), tile_params_.end());
+        pf.data.assign(tile_data_.begin(), tile_data_.end());
+        pf.tag = tag;
+        pending_ = std::move(pf);
+        reset_picture();
+        result.current_deferred = true;
+        return result;
+    }
+
+    const bool shown_key = is_key && picture_.pic_info_fields.bits.show_frame;
+    const uint8_t refresh = shown_key ? static_cast<uint8_t>(0xFF) : choose_refresh_flags(picture_);
+    std::vector<uint8_t> au = assemble_au(picture_, tile_params_, tile_data_, refresh);
+    update_dpb(picture_);
+    result.ready.push_back({ tag, std::move(au), refresh, picture_.order_hint });
+    reset_picture();
+    return result;
+}
+
+std::vector<Av1AccessUnitBuilder::ReadyFrame> Av1AccessUnitBuilder::flush()
+{
+    std::vector<ReadyFrame> out;
+    if (pending_) {
+        /* No successor to reconstruct from: a best-effort mask is fine, nothing
+         * references the tail frame after it. */
+        const uint8_t refresh = choose_refresh_flags(pending_->pic);
+        std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
+        update_dpb(pending_->pic);
+        out.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
+        pending_.reset();
+    }
+    return out;
 }
 
 void Av1AccessUnitBuilder::reset_picture()

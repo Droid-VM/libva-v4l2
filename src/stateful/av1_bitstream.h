@@ -26,6 +26,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -75,6 +76,24 @@ namespace stateful {
  * this unit mirrors that state across frames (Av1Dpb) so skip-mode presence and
  * the global-motion delta base match what the decoder derives. This is a pure,
  * device-free unit so it is host-testable exactly like H264AccessUnitBuilder.
+ *
+ * refresh_frame_flags (the 8-bit mask of DPB slots a frame writes ITSELF into
+ * after decoding) is the one field VA does not carry and cannot be inferred from
+ * a single frame once the 8-slot DPB is full of distinct live surfaces (a deep
+ * B-pyramid -- random-access AV1, what YouTube serves). It IS recoverable with a
+ * ONE-FRAME LOOKAHEAD: VA gives every frame its ref_frame_map[8] (the DPB as that
+ * frame sees it BEFORE it updates it), so the slots frame N refreshed are exactly
+ * those where frame N+1's ref_frame_map now holds N's own surface but N's did
+ * not (reconstruct_refresh_flags()). submit_picture() therefore HOLDS a frame
+ * whose refresh cannot be chosen unambiguously now (the DPB is full and the
+ * least-recently-used slot is a still-live surface's last copy -- evicting it
+ * would drop a reference a later frame needs) until the next frame arrives and
+ * pins down which slot it really refreshed. Low-delay / P-frame streams never
+ * reach that ambiguity (the DPB always has a dead slot, or the LRU victim is a
+ * duplicated anchor), so they are emitted immediately and bit-exactly, exactly
+ * as before -- the one-frame delay is confined to the random-access case. The
+ * unresolved tail frame at end-of-stream is emitted by flush() with a
+ * best-effort mask (nothing references it, so the choice does not matter).
  */
 
 /* Mirrors the AV1 reference DPB (8 slots) the way a decoder would, so the
@@ -103,24 +122,86 @@ public:
 
     /*
      * Assemble the temporal unit for this picture and reset the per-picture
-     * accumulators. Throws std::runtime_error when the header cannot be
-     * re-synthesised (e.g. segmentation, which the GStreamer writer does not
-     * support, or an unresolved reference). Empty when no picture was set.
+     * accumulators, choosing refresh_frame_flags immediately (no lookahead).
+     * Throws std::runtime_error when the header cannot be re-synthesised (e.g.
+     * segmentation, which the GStreamer writer does not support). Empty when no
+     * picture was set. Retained for the single-frame / immediate host tests;
+     * the stateful context drives submit_picture()/flush() instead.
      */
     std::vector<uint8_t> finish();
 
+    /* A temporal unit ready to submit, tagged with the caller's per-frame tag
+     * (the stateful session sequence). refresh_frame_flags / order_hint are
+     * exposed for host ground-truth checks. */
+    struct ReadyFrame {
+        uint64_t tag = 0;
+        std::vector<uint8_t> access_unit;
+        uint8_t refresh_frame_flags = 0;
+        uint32_t order_hint = 0;
+    };
+
+    /* The outcome of accepting one picture (the accumulated set_picture /
+     * add_tile_* state). `ready` holds the temporal units that became
+     * submittable now, in decode order (0..2: a previously deferred frame that
+     * this frame's ref_frame_map just resolved, and/or this frame itself).
+     * `current_deferred` means this frame is held for a one-frame lookahead (its
+     * surface is bound but no AU was produced yet). `current_failed` means it
+     * cannot be re-synthesised (segmentation) and the client must fall back. */
+    struct PictureResult {
+        std::vector<ReadyFrame> ready;
+        bool current_deferred = false;
+        bool current_failed = false;
+    };
+
+    /*
+     * Accept the accumulated picture, tag it, and resolve the one-frame
+     * lookahead (VA2c). Uses this frame's ref_frame_map to recover the deferred
+     * frame's refresh_frame_flags exactly. Never throws for segmentation (it
+     * reports current_failed so a previously deferred frame is not lost).
+     */
+    PictureResult submit_picture(uint64_t tag);
+
+    /* Emit any still-deferred frame with a best-effort refresh mask (end of
+     * stream, or a client that syncs the tail before the next frame arrives). */
+    std::vector<ReadyFrame> flush();
+
     bool has_picture() const { return has_picture_; }
+    bool has_pending() const { return pending_.has_value(); }
+    uint64_t pending_tag() const { return pending_ ? pending_->tag : 0; }
 
     /* Test hooks: the last synthesised gst structures (for host tests). */
     const GstAV1SequenceHeaderOBU& last_sequence_header() const { return seq_; }
     const GstAV1FrameHeaderOBU& last_frame_header() const { return frame_; }
 
 private:
+    /* A frame held for a one-frame lookahead: its parsed VA state, plus the
+     * session tag its surface is already bound to. */
+    struct PendingFrame {
+        VADecPictureParameterBufferAV1 pic {};
+        std::vector<VASliceParameterBufferAV1> tiles;
+        std::vector<uint8_t> data;
+        uint64_t tag = 0;
+    };
+
     void reset_picture();
     void build_sequence_header(const VADecPictureParameterBufferAV1& pic);
-    void build_frame_header(const VADecPictureParameterBufferAV1& pic);
+    void build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags);
+    /* Assemble TD [+ seq] + frame header + tile group for one frame with an
+     * explicit refresh_frame_flags; leaves frame_ populated for update_dpb.
+     * Throws on segmentation. */
+    std::vector<uint8_t> assemble_au(const VADecPictureParameterBufferAV1& pic,
+        std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags);
     void compute_skip_mode_frame(const VADecPictureParameterBufferAV1& pic);
     uint8_t choose_refresh_flags(const VADecPictureParameterBufferAV1& pic) const;
+    /* True when refresh_frame_flags is ambiguous without a lookahead: the DPB is
+     * full of live surfaces AND the least-recently-used slot the immediate
+     * heuristic would evict holds a still-live surface's last copy. */
+    bool refresh_is_ambiguous(const VADecPictureParameterBufferAV1& pic) const;
+    /* Recover a held frame's refresh_frame_flags from the NEXT frame's
+     * ref_frame_map: a slot is refreshed iff it now holds the held frame's own
+     * surface and did not before (VA2c one-frame lookahead). */
+    uint8_t reconstruct_refresh_flags(
+        const VADecPictureParameterBufferAV1& held, const VASurfaceID next_ref_frame_map[8]) const;
     void update_dpb(const VADecPictureParameterBufferAV1& pic);
     int get_relative_dist(int a, int b) const;
 
@@ -135,6 +216,7 @@ private:
     std::vector<uint8_t> last_emitted_sequence_header_;
 
     Av1Dpb dpb_;
+    std::optional<PendingFrame> pending_;
 };
 
 /* 5.11.1 tile_group_obu payload (without the OBU header/size): with one tile it

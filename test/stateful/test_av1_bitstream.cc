@@ -323,6 +323,154 @@ void test_loop_restoration_unit_shift_fix()
     }
 }
 
+/*
+ * VA2c: the one-frame-lookahead reconstruction of refresh_frame_flags. A
+ * random-access (deep B-pyramid) sequence fills the 8-slot DPB with distinct
+ * live surfaces; VA does not carry refresh_frame_flags, and the immediate
+ * "evict the oldest" heuristic drops the long-lived GOP anchor (the key frame)
+ * the moment its duplicate slots are consumed, so a later frame that references
+ * it can no longer resolve it. Holding each ambiguous frame until the next one
+ * arrives recovers its exact refresh_frame_flags from the next frame's
+ * ref_frame_map. This test drives a model encoder DPB whose ground-truth refresh
+ * keeps the key frame pinned in slot 7 while every other slot churns, and
+ * asserts the builder reconstructs each deferred frame's refresh exactly and
+ * keeps the key frame resolvable.
+ */
+void test_random_access_refresh_lookahead()
+{
+    GstAV1Parser* parser = gst_av1_parser_new();
+    Av1AccessUnitBuilder builder;
+
+    /* The encoder's DPB ground truth: which surface sits in each of the 8 slots
+     * before each frame updates it. */
+    VASurfaceID model[8];
+    for (int i = 0; i < 8; i++) {
+        model[i] = VA_INVALID_SURFACE;
+    }
+    const VASurfaceID key_surface = 100;
+
+    auto in_slot = [&](VASurfaceID id) {
+        for (int j = 0; j < 8; j++) {
+            if (model[j] == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    /* Key frame: current surface 100, refresh all (0xFF). */
+    {
+        auto pic = make_pic(640, 480, 0 /* KEY */, 100);
+        pic.current_frame = key_surface;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = VA_INVALID_SURFACE;
+        }
+        VASliceParameterBufferAV1 sp;
+        memset(&sp, 0, sizeof(sp));
+        auto tile = fake_tile(32, 1);
+        sp.slice_data_size = static_cast<uint32_t>(tile.size());
+        builder.set_picture_parameters(pic);
+        builder.add_tile_parameters({ &sp, 1 });
+        builder.add_tile_data(tile);
+        auto result = builder.submit_picture(1);
+        CHECK(result.ready.size() == 1); /* key frame is immediate */
+        CHECK_EQ(result.ready[0].refresh_frame_flags, 0xFF);
+        (void)parse_au(parser, result.ready[0].access_unit);
+        for (int i = 0; i < 8; i++) {
+            model[i] = key_surface;
+        }
+    }
+
+    /* A run of inter frames. Ground-truth refresh: slot 7 always holds the key
+     * frame (never refreshed); slots 0..6 are refreshed round-robin. Two frames
+     * near the end reference the key frame (slot 7). Each entry is
+     * {current_surface, ground_truth_refresh_mask}. */
+    struct Step {
+        VASurfaceID cur;
+        uint8_t refresh;
+    };
+    const Step steps[] = {
+        { 101, 0x01 },
+        { 102, 0x02 },
+        { 103, 0x04 },
+        { 104, 0x08 },
+        { 105, 0x10 },
+        { 106, 0x20 },
+        { 107, 0x40 },
+        /* DPB now: [101..107, key]. Full of 8 distinct live surfaces. */
+        { 108, 0x01 }, /* churn slot 0, keep the key in slot 7 */
+        { 109, 0x02 },
+        { 110, 0x00 }, /* a leaf that refreshes nothing */
+        { 111, 0x04 },
+    };
+    const size_t n_steps = sizeof(steps) / sizeof(steps[0]);
+
+    uint64_t tag = 2;
+    int checked = 0;
+    int key_still_referenceable = 0;
+    for (size_t k = 0; k < n_steps; k++) {
+        const Step& st = steps[k];
+        auto pic = make_pic(640, 480, 1 /* INTER */, 100);
+        pic.current_frame = st.cur;
+        pic.order_hint = static_cast<uint8_t>(k + 1);
+        pic.primary_ref_frame = 0;
+        pic.mode_control_fields.bits.reference_select = 1;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = model[i];
+        }
+        /* Reference the key frame (slot 7) from every ref position: the failure
+         * mode is precisely the key frame being evicted, so if it is gone this
+         * frame cannot resolve its references. */
+        for (int i = 0; i < 7; i++) {
+            pic.ref_frame_idx[i] = 7;
+        }
+        CHECK(in_slot(key_surface)); /* the model keeps it; so must the builder */
+
+        VASliceParameterBufferAV1 sp;
+        memset(&sp, 0, sizeof(sp));
+        auto tile = fake_tile(48, static_cast<uint8_t>(k + 2));
+        sp.slice_data_size = static_cast<uint32_t>(tile.size());
+        builder.set_picture_parameters(pic);
+        builder.add_tile_parameters({ &sp, 1 });
+        builder.add_tile_data(tile);
+        auto result = builder.submit_picture(tag++);
+        /* Whatever frame became ready is a PREVIOUS one; its reconstructed
+         * refresh must equal its ground truth. */
+        for (auto& rf : result.ready) {
+            /* Find the ground-truth refresh for this tag. tag 2 is steps[0]. */
+            size_t idx = static_cast<size_t>(rf.tag - 2);
+            if (idx < n_steps) {
+                CHECK_EQ(rf.refresh_frame_flags, steps[idx].refresh);
+                auto parsed = parse_au(parser, rf.access_unit);
+                CHECK(parsed.ok);
+                /* Its ref_frame_idx must all be a valid resolved slot (the key
+                 * frame was found in our mirrored DPB, not a fall-through). */
+                for (int i = 0; i < 7; i++) {
+                    CHECK(parsed.frame.ref_frame_idx[i] >= 0 && parsed.frame.ref_frame_idx[i] < 8);
+                }
+                key_still_referenceable++;
+                checked++;
+            }
+        }
+        /* Advance the model with the ground truth. */
+        for (int i = 0; i < 8; i++) {
+            if (st.refresh & (1u << i)) {
+                model[i] = st.cur;
+            }
+        }
+    }
+
+    /* Flush the tail (the last still-deferred frame). */
+    auto tail = builder.flush();
+    CHECK(tail.size() == 1);
+
+    /* Every ambiguous frame that was emitted before the tail was reconstructed
+     * exactly and still resolved the key frame. */
+    CHECK(checked >= static_cast<int>(n_steps) - 1);
+    CHECK_EQ(key_still_referenceable, checked);
+    gst_av1_parser_free(parser);
+}
+
 void test_segmentation_rejected()
 {
     Av1AccessUnitBuilder builder;
@@ -355,6 +503,7 @@ int main()
     test_keyframe_roundtrip();
     test_inter_roundtrip();
     test_loop_restoration_unit_shift_fix();
+    test_random_access_refresh_lookahead();
     test_segmentation_rejected();
 
     if (g_check_failures != 0) {

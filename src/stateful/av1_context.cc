@@ -93,6 +93,20 @@ StatefulAV1Context::~StatefulAV1Context()
             }
         }
     }
+    /* Emit any frame still held for the lookahead so the session drains it
+     * cleanly (best-effort: its surface is unbound above). */
+    try {
+        std::vector<stateful::Av1AccessUnitBuilder::ReadyFrame> tail;
+        {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            tail = au_builder_.flush();
+        }
+        for (auto& ready : tail) {
+            session_.submit(ready.tag, ready.access_unit);
+        }
+    } catch (const std::exception&) {
+        /* Teardown: a failed tail submit is harmless. */
+    }
     session_.finish();
 }
 
@@ -139,31 +153,48 @@ void StatefulAV1Context::stateful_begin_picture(Surface& surface)
 
 VAStatus StatefulAV1Context::stateful_end_picture(VADriverContextP va_context, Surface& surface)
 {
-    std::vector<uint8_t> access_unit;
-    try {
-        std::lock_guard<std::mutex> guard(builder_mutex_);
-        access_unit = au_builder_.finish();
-    } catch (const std::exception& e) {
-        error_log(va_context, "Failed to assemble AV1 access unit: %s\n", e.what());
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-    if (access_unit.empty()) {
-        error_log(va_context, "vaEndPicture without AV1 frame data\n");
-        return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
-
+    stateful::Av1AccessUnitBuilder::PictureResult result;
     uint64_t sequence;
     {
         std::lock_guard<std::mutex> guard(builder_mutex_);
+        if (!au_builder_.has_picture()) {
+            error_log(va_context, "vaEndPicture without AV1 frame data\n");
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
         sequence = next_sequence_++;
-    }
-    try {
-        session_.submit(sequence, access_unit);
-    } catch (const std::exception& e) {
-        error_log(va_context, "Failed to submit AV1 access unit: %s\n", e.what());
-        return session_.dead() ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_OPERATION_FAILED;
+        try {
+            /* VA2c: resolve the one-frame lookahead. This may emit a previously
+             * deferred frame (using this frame's ref_frame_map to recover its
+             * refresh_frame_flags) and/or this frame; a random-access frame
+             * whose refresh is still ambiguous is held for the next call. */
+            result = au_builder_.submit_picture(sequence);
+        } catch (const std::exception& e) {
+            error_log(va_context, "Failed to assemble AV1 access unit: %s\n", e.what());
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
 
+    /* Submit the temporal units that became ready, in decode order, outside the
+     * builder lock (a submit can wait on the device; the driver-wide/session
+     * lock order forbids holding it across that). */
+    for (auto& ready : result.ready) {
+        try {
+            session_.submit(ready.tag, ready.access_unit);
+        } catch (const std::exception& e) {
+            error_log(va_context, "Failed to submit AV1 access unit: %s\n", e.what());
+            return session_.dead() ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+    }
+
+    if (result.current_failed) {
+        error_log(va_context, "Failed to assemble AV1 access unit: segmentation is unsupported\n");
+        render_surface_id = VA_INVALID_ID;
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    /* Bind this surface to its sequence whether it was submitted now or is held
+     * for the lookahead -- it is then submitted by the next vaEndPicture, or by
+     * sync_surface below if the client waits on it first. */
     surface.stateful_context = this;
     surface.stateful_sequence = sequence;
     surface.stateful_capture_index = -1;
@@ -179,6 +210,26 @@ VAStatus StatefulAV1Context::sync_surface(VADriverContextP va_context, Surface& 
     }
     if (surface.status != VASurfaceRendering) {
         return VA_STATUS_SUCCESS;
+    }
+
+    /* VA2c: the client is waiting on a frame still held for the one-frame
+     * lookahead -- the end-of-stream tail, or a low-delay client that syncs each
+     * frame before decoding the next. No successor is coming in time, so emit it
+     * now with a best-effort refresh_frame_flags and submit it before we wait. */
+    std::vector<stateful::Av1AccessUnitBuilder::ReadyFrame> tail;
+    {
+        std::lock_guard<std::mutex> guard(builder_mutex_);
+        if (au_builder_.has_pending() && au_builder_.pending_tag() == surface.stateful_sequence) {
+            tail = au_builder_.flush();
+        }
+    }
+    for (auto& ready : tail) {
+        try {
+            session_.submit(ready.tag, ready.access_unit);
+        } catch (const std::exception& e) {
+            error_log(va_context, "Failed to submit deferred AV1 access unit: %s\n", e.what());
+            return session_.dead() ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
 
     stateful::StatefulSession::Frame frame;
