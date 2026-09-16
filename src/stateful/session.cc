@@ -311,20 +311,28 @@ void StatefulSession::handle_source_change_locked()
 
     if (capture_mode_ == CaptureMode::gbm_dmabuf) {
         /* 7.7 point 2: with DMABUF the client owns the buffers, so a surface is
-         * a buffer. The pool must cover the codec's own minimum working set AND
-         * the surfaces the client holds concurrently (its reorder/compositing
-         * queue) -- the same headroom the MMAP path adds below (7.6 point 4).
-         * The shipped max(num_surfaces, min) gave the codec exactly its minimum
-         * whenever the client made fewer surfaces than that -- ffmpeg-VAAPI
-         * makes ~10 for AV1 against a min of 21 -- so a reorder-heavy AV1 stream
-         * starved: the client's held surfaces came out of the codec's own
-         * slots, the codec stalled waiting for one back, and the 50 ms idle
-         * drain fired mid-stream into a failed sync (D85/D86). VA2d measured
-         * 854x480 random-access AV1 truncating in gbm (~1 run in 3) where the
-         * min+share MMAP pool was solid; H.264/VP9, with almost no reorder,
-         * never starved. Mirror MMAP: min + share, and at least num_surfaces so
-         * a client that made MORE still gets a bo per surface. */
-        const unsigned gbm_share = std::min(num_surfaces_, kPoolShareCap);
+         * a buffer -- every surface the client holds for its display/reorder
+         * queue is subtracted from the codec's own working set, unlike MMAP
+         * where a held surface is a CPU copy and the buffer is recycled at once
+         * (7.6 point 4). So the pool must be the codec minimum PLUS the client's
+         * concurrent hold-set. VA2d gave gbm the MMAP headroom (min + share),
+         * but share was min(num_surfaces, 8) and num_surfaces here is the count
+         * at the first SOURCE_CHANGE (D84): a lazily-allocating client reports
+         * it as 1 (Firefox makes one surface at a time), collapsing the share to
+         * +1. A high-minimum codec then got only min+1: AV1's
+         * MIN_BUFFERS_FOR_CAPTURE is 21, so the browser pool was 22 and the
+         * moment Firefox held a second surface the codec had < 21 buffers
+         * queued, stalled, and the awaited frame never arrived -- Stateful sync
+         * failed on sequence ~4, softing YouTube AV1 off zero-copy (VA2h). VP9
+         * (min 4) and H.264 (min 10) had enough slack under the same share to
+         * absorb the browser's ~6-surface hold-set (VP9-854 sustained 825
+         * imports), so only AV1 at its 21-buffer floor starved (D85/D86). Fix
+         * (VA2i): give gbm the full kPoolShareCap headroom over the codec
+         * minimum regardless of the early surface count, capped at 32 -- AV1
+         * 854/1080p -> 29 (8 holdable, matching the 1080p ffmpeg pool that never
+         * truncated), VP9 -> 12, H.264 -> 18 -- and still at least num_surfaces
+         * so a client that made MORE gets a bo per surface. */
+        const unsigned gbm_share = kPoolShareCap;
         unsigned count = std::min(std::max(num_surfaces_, min_buffers + gbm_share), kMaxCaptureBuffers);
         if (provision_capture_gbm_locked(count)) {
             provisioned_ = true;

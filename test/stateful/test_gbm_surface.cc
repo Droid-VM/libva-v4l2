@@ -149,10 +149,11 @@ void test_gbm_mode_when_capable()
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
     CHECK(device.capture_dmabuf);
     CHECK_EQ(device.set_capture_stride_calls, 0u); /* strides matched, no negotiation */
-    /* count = max(surfaces 6, min 4 + share min(6,8)=6 = 10) = 10 (7.7 point 2:
-     * the codec's minimum plus the client's held-surface headroom). */
-    CHECK_EQ(device.capture_count, 10u);
-    CHECK_EQ(allocator.allocations, 10u);
+    /* count = max(surfaces 6, min 4 + share 8 = 12) = 12 (7.7 point 2, VA2i: the
+     * codec's minimum plus the full kPoolShareCap held-surface headroom, since
+     * in gbm mode a surface IS a buffer). */
+    CHECK_EQ(device.capture_count, 12u);
+    CHECK_EQ(allocator.allocations, 12u);
 }
 
 void test_stride_negotiated_then_gbm()
@@ -396,8 +397,9 @@ void test_dmabuf_qbuf_einval_also_falls_back()
 
 void test_spares_when_min_exceeds_surfaces()
 {
-    /* Fewer surfaces than the codec minimum: the pool is min + share, and the
-     * bos beyond the client's surfaces are internal spares (7.7 point 2). */
+    /* Fewer surfaces than the codec minimum: in gbm mode a surface IS a buffer,
+     * so the pool is min + the full kPoolShareCap headroom (VA2i), and the bos
+     * beyond the client's surfaces are internal spares (7.7 point 2). */
     FakeDevice device;
     device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
     device.scripted_min_buffers = 10;
@@ -408,9 +410,52 @@ void test_spares_when_min_exceeds_surfaces()
 
     decode_one(session, 1);
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
-    /* max(surfaces 2, min 10 + share min(2,8)=2 = 12) = 12. */
-    CHECK_EQ(device.capture_count, 12u);
-    CHECK_EQ(allocator.allocations, 12u);
+    /* max(surfaces 2, min 10 + share 8 = 18) = 18. */
+    CHECK_EQ(device.capture_count, 18u);
+    CHECK_EQ(allocator.allocations, 18u);
+}
+
+void test_gbm_headroom_survives_a_lazy_surface_count()
+{
+    /* VA2i, THE fix: AV1's MIN_BUFFERS_FOR_CAPTURE is 21. A lazily-allocating
+     * browser has made only its first surface when the first SOURCE_CHANGE
+     * provisions the gbm pool (D84), so surface_count reads 1. The shipped
+     * share of min(num_surfaces, 8) then collapsed to +1, giving AV1 a
+     * 22-buffer pool with only ONE buffer holdable above the codec's 21-buffer
+     * floor -- the moment Firefox held a second surface the codec had < 21
+     * queued, stalled, and the awaited frame never arrived (Stateful sync
+     * failed on sequence ~4, VA2h). The pool must instead give the full
+     * kPoolShareCap headroom regardless of the early count, so a client that
+     * grows its hold-set later (Firefox composites ~6) does not starve the
+     * codec. Named mutation this fails under: restore
+     * gbm_share = min(num_surfaces_, kPoolShareCap) -> the pool is 22 again and
+     * only 1 buffer is holdable. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.scripted_min_buffers = 21; /* the phone's AV1 MIN_BUFFERS_FOR_CAPTURE */
+    /* The phone's 854x480 AV1 geometry: tight 854 luma stride, GBM pads the R8
+     * container to 896 and the qti codec keeps its 854 stride (VA2g slack). */
+    device.capture_stride_negotiable = false;
+    device.scripted_format.width = 854;
+    device.scripted_format.height = 480;
+    device.scripted_format.bytesperline = 854;
+    device.scripted_format.sizeimage = 854u * 480u * 3u / 2u; /* 614880 */
+    device.scripted_format.num_planes = 1;
+    FakeAllocator allocator;
+    allocator.align_stride_to_width = true;
+    allocator.align_stride = 64; /* align_up(854, 64) = 896 */
+    StatefulSession::Options options = gbm_options(&allocator);
+    options.num_surfaces = 0; /* what vaCreateContext really passes */
+    options.surface_count = [] { return 1u; }; /* Firefox has made one so far */
+    StatefulSession session(device, 0x30315641 /* AV01 */, 854, 480, options);
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
+    /* max(surfaces 1, min 21 + share 8 = 29) = 29, NOT the old min+1 = 22. */
+    CHECK_EQ(device.capture_count, 29u);
+    CHECK_EQ(allocator.allocations, 29u);
+    /* The client can hold a full compositor queue without starving the codec. */
+    CHECK_EQ(device.capture_count - static_cast<unsigned>(device.scripted_min_buffers), 8u);
 }
 
 /* --- DMABUF QBUF plane fields (7.7 point 2/5b) --- */
@@ -638,6 +683,7 @@ int main()
     test_dmabuf_qbuf_eio_falls_back_to_mmap_and_decodes();
     test_dmabuf_qbuf_einval_also_falls_back();
     test_spares_when_min_exceeds_surfaces();
+    test_gbm_headroom_survives_a_lazy_surface_count();
     test_dmabuf_qbuf_single_plane();
     test_dmabuf_qbuf_two_plane_offsets();
     test_capture_buffer_map_roundtrip();
