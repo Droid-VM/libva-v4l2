@@ -56,6 +56,13 @@ stateful::StatefulSession::Options session_options(
     /* 7.7: provision CAPTURE from GBM dma-bufs when the allocator is usable and
      * the device advertises SUPPORTS_DMABUF; the session decides and logs once. */
     options.allocator = allocator;
+    /* VA2e: VP9 forwards each frame verbatim and its display order is in-band
+     * (show_existing_frame), so the stateful decoder outputs displayable frames
+     * without a drain -- there is no held tail mid-stream (unlike H.264). Mirror
+     * AV1 and suppress the mid-stream idle/timeout DEC_CMD_STOP drain (D85/D86):
+     * a mid-stream reset would break the reference chain. finish() still drains
+     * the true tail at EOS. */
+    options.allow_midstream_drain = false;
     return options;
 }
 

@@ -56,6 +56,13 @@ stateful::StatefulSession::Options session_options(
     /* 7.7: provision CAPTURE from GBM dma-bufs when the allocator is usable and
      * the device advertises SUPPORTS_DMABUF; the session decides and logs once. */
     options.allocator = allocator;
+    /* VA2e: AV1 emits every reconstructed frame as shown (VA2c 50d4b0a), so the
+     * stateful decoder outputs one frame per decode op -- there is no held
+     * B-frame tail to shake loose mid-stream. Suppress the mid-stream idle/
+     * timeout DEC_CMD_STOP drain (D85/D86): mid-stream it would RESET the
+     * decoder's DPB and break AV1's reference chain, softing the browser off
+     * zero-copy (VA2d). finish() still drains the true tail at EOS. */
+    options.allow_midstream_drain = false;
     return options;
 }
 

@@ -366,6 +366,109 @@ void test_reenterable_recovery()
     CHECK(!session.dead());
 }
 
+void test_midstream_drain_is_codec_aware()
+{
+    /* VA2e: the mid-stream idle/timeout DEC_CMD_STOP drain is H.264-only. AV1
+     * and VP9 emit every access unit as shown, so the decoder outputs one
+     * frame per decode op -- there is no held reorder tail to drain out, and a
+     * mid-stream DEC_CMD_STOP would only reset the DPB and break the reference
+     * chain (VA2d). With Options.allow_midstream_drain = false a stalled sync
+     * must wait out the hard cap and fail THIS surface WITHOUT a DEC_CMD_STOP;
+     * with it true (H.264) the same stall must still drain. finish() drains the
+     * genuine tail at EOS in both. Named mutations this fails under: default
+     * allow_midstream_drain false (H.264 stops draining -- Part B) or drop the
+     * !allow_midstream_drain_ gate in sync() (AV1/VP9 drain and reset again --
+     * Part A). */
+
+    /* Part A -- AV1/VP9 (drain suppressed): a mid-stream idle stall issues NO
+     * DEC_CMD_STOP; the sync waits out the hard cap and reports a per-surface
+     * decode error, session alive and provisioned, DPB never reset. The
+     * on_decoder_stop script would deliver the frame IF a drain fired -- it
+     * must never run. */
+    {
+        FakeDevice device;
+        device.manual_delivery = true;
+        device.on_decoder_stop = [&device]() { device.deliver(1, /*last=*/true); };
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 40;
+        options.sync_idle_ms = 5;
+        options.allow_midstream_drain = false;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::decode_error);
+        CHECK_EQ(device.decoder_stops, 0u); /* the reset that breaks AV1 never fired */
+        CHECK_EQ(device.decoder_starts, 0u);
+        CHECK_EQ(session.idle_drains(), 0u);
+        CHECK_EQ(session.timeout_recoveries(), 0u);
+        CHECK(!session.dead());
+        CHECK(session.provisioned()); /* alive for the frames that follow */
+    }
+
+    /* Part B -- H.264 (default, drain allowed): the same idle stall STILL
+     * drains, and the tail comes out. This is what the mid-stream drain is FOR
+     * (D85/D86, B18/B19); it must not regress. */
+    {
+        FakeDevice device;
+        device.manual_delivery = true;
+        device.on_decoder_stop = [&device]() { device.deliver(1, /*last=*/true); };
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 500;
+        options.sync_idle_ms = 5;
+        /* allow_midstream_drain defaults true (H.264) */
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(session.idle_drains(), 1u);
+        CHECK_EQ(session.timeout_recoveries(), 0u);
+        CHECK_EQ(device.decoder_stops, 1u);
+        CHECK_EQ(device.decoder_starts, 1u);
+    }
+
+    /* Part C -- AV1/VP9 normal decode still works with the drain off: a frame
+     * the decoder produces on its own is claimed with no DEC_CMD_STOP. */
+    {
+        FakeDevice device; /* automatic FIFO delivery */
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 30;
+        options.allow_midstream_drain = false;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+        session.submit(1, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(device.decoder_stops, 0u);
+    }
+
+    /* Part D -- EOS drain is independent of the flag: finish() still issues
+     * DEC_CMD_STOP to flush the genuine tail even with mid-stream drain off. */
+    {
+        FakeDevice device;
+        device.manual_delivery = true;
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 30;
+        options.allow_midstream_drain = false;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+        session.submit(1, fake_au());
+        device.deliver(1);
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+
+        session.submit(2, fake_au());
+        device.on_decoder_stop = [&device]() { device.deliver(2, /*last=*/true); };
+        session.finish();
+        CHECK_EQ(device.decoder_stops, 1u); /* EOS drain fires regardless of the flag */
+    }
+}
+
 void test_provision_retry_on_ebusy()
 {
     /* Post-crash (D88): the device refuses REQBUFS/STREAMON with EBUSY while it
@@ -580,6 +683,7 @@ int main()
     test_timeout_drain_recovery();
     test_idle_drain_on_stream_tail();
     test_reenterable_recovery();
+    test_midstream_drain_is_codec_aware();
     test_provision_retry_on_ebusy();
     test_no_drain_before_source_change();
     test_output_ring_growth();

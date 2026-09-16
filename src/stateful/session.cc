@@ -108,6 +108,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
+    , allow_midstream_drain_(options.allow_midstream_drain)
     , provision_retry_ms_(options.provision_retry_ms >= 0 ? options.provision_retry_ms : kDefaultProvisionRetryMs)
     , output_pixelformat_(coded_pixelformat)
     , coded_width_(coded_width)
@@ -888,6 +889,25 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
 
             const bool idle_expired = now >= idle_deadline;
             if (hard_expired || idle_expired) {
+                if (!allow_midstream_drain_) {
+                    /* VA2e: AV1/VP9 emit every access unit as shown, so no
+                     * held reorder tail needs a mid-stream drain to come out --
+                     * the awaited frame arrives as the decoder works through
+                     * the input already queued. The DEC_CMD_STOP drain
+                     * (D85/D86) is H.264-only here: mid-stream it RESETS the
+                     * decoder's DPB and breaks AV1's reference chain, which is
+                     * exactly what softed Firefox off zero-copy YouTube AV1
+                     * (VA2d). So never drain mid-stream: keep waiting for the
+                     * frame up to the hard cap, and on the cap fail THIS
+                     * surface only -- no DEC_CMD_STOP, DPB and session intact
+                     * for the frames that follow. finish() still drains the
+                     * genuine tail at EOS. */
+                    if (hard_expired) {
+                        return SyncStatus::decode_error;
+                    }
+                    wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
+                    continue;
+                }
                 return recover_locked(lock, sequence, frame, idle_expired && !hard_expired);
             }
 

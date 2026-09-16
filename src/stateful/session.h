@@ -76,6 +76,22 @@ public:
          * this way). While input keeps flowing the sync waits up to
          * sync_timeout_ms instead. < 0: LIBVA_V4L2_SYNC_IDLE_MS or 50. */
         int sync_idle_ms = -1;
+        /* D85/D86, VA2e: the mid-stream idle/timeout DEC_CMD_STOP drain
+         * (recover_locked) exists for H.264, whose reorder tail the codec
+         * holds back until a drain shakes it loose -- VA-API has no flush/EOS
+         * call, so a mid-stream sync must drain to extract it (B18/B19). AV1
+         * and VP9 must NOT: every access unit is emitted as shown (AV1: the
+         * reconstructed OBU forces show_frame=1, VA2c 50d4b0a; VP9:
+         * show_existing_frame is in-band), so the stateful decoder outputs one
+         * frame per decode op and the awaited frame arrives as input is
+         * processed -- there is no held tail mid-stream to drain out. A
+         * DEC_CMD_STOP mid-stream would only RESET the decoder's DPB and break
+         * the reference chain (VA2d: the last mile before sustained YouTube
+         * AV1 zero-copy). H.264 keeps this true; AV1/VP9 clear it, and a
+         * mid-stream sync then waits out the hard cap without a reset and fails
+         * only THIS surface as a last resort. finish() (EOS) still drains the
+         * true tail in every codec. */
+        bool allow_midstream_drain = true;
         /* D88/post-crash: a fresh client's REQBUFS/STREAMON can be refused
          * EBUSY while the device is still reaping a crashed client's session
          * (B18/B19: the next process hits it within milliseconds). Provisioning
@@ -166,6 +182,7 @@ public:
     unsigned idle_drains() const { return idle_drains_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     int sync_idle_ms() const { return sync_idle_ms_; }
+    bool allow_midstream_drain() const { return allow_midstream_drain_; }
     StatefulDevice& device() { return device_; }
 
 private:
@@ -208,6 +225,7 @@ private:
     unsigned output_ring_size_;
     int sync_timeout_ms_;
     int sync_idle_ms_;
+    bool allow_midstream_drain_;
     int provision_retry_ms_;
     uint32_t output_pixelformat_;
     uint32_t coded_width_;
