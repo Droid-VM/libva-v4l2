@@ -113,6 +113,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , output_pixelformat_(coded_pixelformat)
     , coded_width_(coded_width)
     , coded_height_(coded_height)
+    , trace_(getenv("LIBVA_V4L2_TRACE") != nullptr)
 {
     /* Construction is single-threaded: the context does not exist yet. */
 
@@ -185,6 +186,42 @@ void StatefulSession::log(const char* message)
     } else {
         fprintf(stderr, "libva-v4l2 stateful: %s\n", message);
     }
+}
+
+void StatefulSession::trace_dump_locked(const char* tag, uint64_t await)
+{
+    if (!trace_) {
+        return;
+    }
+    /* free CAPTURE = pool minus what the client holds minus what is stashed
+     * (produced, not yet claimed): if this is small the codec is starved of
+     * CAPTURE buffers; if it is large the codec has room but is not producing
+     * the awaited frame. */
+    const long free_cap = static_cast<long>(capture_count_) - static_cast<long>(client_owned_.size())
+        - static_cast<long>(stash_.size());
+    char head[256];
+    snprintf(head, sizeof(head),
+        "TRACE %s await=%llu provisioned=%d cap_count=%u client_owned=%zu stash=%zu free_cap=%ld free_out=%zu "
+        "qout=%u submits=%llu delivered=%llu harvesting=%d",
+        tag, static_cast<unsigned long long>(await), provisioned_.load() ? 1 : 0, capture_count_, client_owned_.size(),
+        stash_.size(), free_cap, free_outputs_.size(), queued_outputs_, static_cast<unsigned long long>(submit_count_),
+        static_cast<unsigned long long>(delivered_), harvesting_ ? 1 : 0);
+    log(head);
+
+    /* The stash keys tell whether the awaited sequence is already produced. */
+    std::string keys = "TRACE   stash_keys=[";
+    unsigned n = 0;
+    for (const auto& [seq, idx] : stash_) {
+        if (n++ >= 24) {
+            keys += " ...";
+            break;
+        }
+        char b[24];
+        snprintf(b, sizeof(b), "%s%llu", n == 1 ? "" : " ", static_cast<unsigned long long>(seq));
+        keys += b;
+    }
+    keys += "]";
+    log(keys.c_str());
 }
 
 void StatefulSession::pump_locked()
@@ -607,6 +644,13 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
     }
     if (frame.bytesused == 0 || frame.error) {
         /* An empty LAST (or erroneous) buffer carries no frame; recycle it. */
+        if (trace_) {
+            char line[128];
+            snprintf(line, sizeof(line), "TRACE CAP-DROP seq=%llu idx=%u bytesused=%u error=%d last=%d",
+                static_cast<unsigned long long>(frame.sequence), frame.index, frame.bytesused, frame.error ? 1 : 0,
+                frame.last ? 1 : 0);
+            log(line);
+        }
         requeue_capture_locked(frame.index);
         return;
     }
@@ -615,6 +659,12 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
         return;
     }
     stash_[frame.sequence] = frame.index;
+    if (trace_) {
+        char line[128];
+        snprintf(line, sizeof(line), "TRACE CAP seq=%llu idx=%u stash=%zu client_owned=%zu",
+            static_cast<unsigned long long>(frame.sequence), frame.index, stash_.size(), client_owned_.size());
+        log(line);
+    }
     cv_.notify_all();
 }
 
@@ -628,6 +678,7 @@ bool StatefulSession::claim_locked(uint64_t sequence, Frame* frame)
     frame->generation = generation_;
     client_owned_.insert(it->second);
     stash_.erase(it);
+    delivered_ += 1;
     return true;
 }
 
@@ -734,6 +785,13 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
         device_.queue_output(static_cast<unsigned>(index), sequence, access_unit.size());
         queued_outputs_ += 1;
         submit_count_ += 1; /* D85: waiting syncs watch this for input flow */
+        if (trace_) {
+            char line[128];
+            snprintf(line, sizeof(line), "TRACE SUBMIT seq=%llu qout=%u free_out=%zu submits=%llu",
+                static_cast<unsigned long long>(sequence), queued_outputs_, free_outputs_.size(),
+                static_cast<unsigned long long>(submit_count_));
+            log(line);
+        }
         cv_.notify_all();
     } catch (const DeviceLost&) {
         dead_ = true;
@@ -813,6 +871,13 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
         device_.decoder_stop();
         const bool saw_last = drain_capture_locked(lock, sync_timeout_ms_);
         device_.decoder_start();
+        if (trace_) {
+            char line[160];
+            snprintf(line, sizeof(line), "TRACE DRAIN-DONE await=%llu saw_last=%d stash=%zu submits=%llu",
+                static_cast<unsigned long long>(sequence), saw_last ? 1 : 0, stash_.size(),
+                static_cast<unsigned long long>(submit_count_));
+            log(line);
+        }
 
         /* D86: make the recovery re-enterable. DEC_CMD_STOP's seek can pause
          * the OUTPUT queue, so re-assert STREAMON(OUTPUT) before feeding
@@ -863,6 +928,7 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
      * which. */
     uint64_t submits_seen = submit_count_;
     auto idle_since = Clock::now();
+    bool logged_wait = false;
 
     try {
         while (true) {
@@ -870,6 +936,10 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
 
             if (claim_locked(sequence, frame)) {
                 return SyncStatus::ok;
+            }
+            if (trace_ && !logged_wait) {
+                logged_wait = true;
+                trace_dump_locked("SYNC-WAIT", sequence);
             }
             if (dead_) {
                 return SyncStatus::dead;
@@ -889,6 +959,7 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
                  * hard cap, then give up on this surface without a drain;
                  * the session stays alive for the frames that follow. */
                 if (hard_expired) {
+                    trace_dump_locked("WEDGE-preannounce", sequence);
                     return SyncStatus::decode_error;
                 }
                 wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
@@ -898,19 +969,24 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             const bool idle_expired = now >= idle_deadline;
             if (hard_expired || idle_expired) {
                 if (!allow_midstream_drain_) {
-                    /* VA2e: AV1/VP9 emit every access unit as shown, so no
-                     * held reorder tail needs a mid-stream drain to come out --
-                     * the awaited frame arrives as the decoder works through
-                     * the input already queued. The DEC_CMD_STOP drain
-                     * (D85/D86) is H.264-only here: mid-stream it RESETS the
-                     * decoder's DPB and breaks AV1's reference chain, which is
-                     * exactly what softed Firefox off zero-copy YouTube AV1
-                     * (VA2d). So never drain mid-stream: keep waiting for the
-                     * frame up to the hard cap, and on the cap fail THIS
-                     * surface only -- no DEC_CMD_STOP, DPB and session intact
-                     * for the frames that follow. finish() still drains the
-                     * genuine tail at EOS. */
+                    /* VP9 and AV1 (VA3-sync-reorder). VP9's display order is
+                     * in-band (show_existing_frame) so the decoder emits
+                     * displayable frames with no held tail -- solid 300/300 incl.
+                     * 854 (VA2j). AV1 deep-B DOES hold a decode-order pipeline
+                     * tail, but a mid-stream DEC_CMD_STOP drain cannot extract it:
+                     * on this device the drain DROPS the held frame and emits only
+                     * an empty LAST (VA3-sync-reorder measurement), so draining
+                     * would lose the frame AND reset the reference chain. Only
+                     * H.264 (allow_midstream_drain default true) takes the
+                     * recover_locked branch below, and only at its EOS tail where
+                     * the drain flushes cleanly. So here keep waiting up to the
+                     * hard cap and, on the cap, fail THIS surface only -- no
+                     * DEC_CMD_STOP, DPB and session intact for the frames that
+                     * follow (deep-B AV1 then falls back to software; VP9 is the
+                     * zero-copy browser path). finish() still drains the genuine
+                     * tail at EOS. */
                     if (hard_expired) {
+                        trace_dump_locked("WEDGE-nodrain", sequence);
                         return SyncStatus::decode_error;
                     }
                     wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);

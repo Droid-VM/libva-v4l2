@@ -76,21 +76,25 @@ public:
          * this way). While input keeps flowing the sync waits up to
          * sync_timeout_ms instead. < 0: LIBVA_V4L2_SYNC_IDLE_MS or 50. */
         int sync_idle_ms = -1;
-        /* D85/D86, VA2e: the mid-stream idle/timeout DEC_CMD_STOP drain
-         * (recover_locked) exists for H.264, whose reorder tail the codec
-         * holds back until a drain shakes it loose -- VA-API has no flush/EOS
-         * call, so a mid-stream sync must drain to extract it (B18/B19). AV1
-         * and VP9 must NOT: every access unit is emitted as shown (AV1: the
-         * reconstructed OBU forces show_frame=1, VA2c 50d4b0a; VP9:
-         * show_existing_frame is in-band), so the stateful decoder outputs one
-         * frame per decode op and the awaited frame arrives as input is
-         * processed -- there is no held tail mid-stream to drain out. A
-         * DEC_CMD_STOP mid-stream would only RESET the decoder's DPB and break
-         * the reference chain (VA2d: the last mile before sustained YouTube
-         * AV1 zero-copy). H.264 keeps this true; AV1/VP9 clear it, and a
-         * mid-stream sync then waits out the hard cap without a reset and fails
-         * only THIS surface as a last resort. finish() (EOS) still drains the
-         * true tail in every codec. */
+        /* D85/D86: the mid-stream idle/timeout DEC_CMD_STOP drain
+         * (recover_locked) exists for H.264, whose reorder tail the codec holds
+         * back until a drain shakes it loose -- VA-API has no flush/EOS call, so
+         * a mid-stream sync must drain to extract it (B18/B19). VP9 clears it:
+         * its display order is in-band (show_existing_frame), so there is no held
+         * tail mid-stream. AV1 ALSO clears it, but for a subtler reason than
+         * VA2e's original note claimed (VA3-sync-reorder corrects it): the QTI
+         * decoder DOES hold a small decode-order output-pipeline tail on deep-B
+         * content, but a mid-stream DEC_CMD_STOP cannot extract it -- on this
+         * device the drain DROPS the held frame and emits only an empty LAST
+         * (measured: CAP-DROP seq=0 bytesused=0 last=1, stash unchanged), so
+         * draining would lose the frame and reset the reference chain. A
+         * single-threaded display-order VA-API client blocks on that held frame
+         * and cannot feed ahead, so deep-B AV1 wedges with no in-stack remedy
+         * (crosvm KEY_LOW_LATENCY VA2k and the .low_latency variant VA2l are both
+         * refuted); it falls back to software while VP9 carries browser zero-copy.
+         * When false, a mid-stream sync waits out the hard cap without a reset and
+         * fails only THIS surface as a last resort. finish() (EOS) still drains
+         * the true tail in every codec. */
         bool allow_midstream_drain = true;
         /* D88/post-crash: a fresh client's REQBUFS/STREAMON can be refused
          * EBUSY while the device is still reaping a crashed client's session
@@ -261,6 +265,14 @@ private:
     uint64_t submit_count_ = 0; /* total submits; syncs watch it for input flow (D85) */
     unsigned timeout_recoveries_ = 0;
     unsigned idle_drains_ = 0;
+
+    /* VA3-sync-reorder investigation: behaviour-neutral tracing gated on
+     * LIBVA_V4L2_TRACE. Logs submit/capture/claim and, at a stalled sync, a
+     * full accounting (awaited sequence, stash contents, CAPTURE ownership,
+     * OUTPUT flow) so the reorder wedge mechanism can be read off directly. */
+    bool trace_ = false;
+    uint64_t delivered_ = 0; /* successful claims */
+    void trace_dump_locked(const char* tag, uint64_t await);
 };
 
 } // namespace stateful

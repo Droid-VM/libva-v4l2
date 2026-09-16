@@ -56,12 +56,28 @@ stateful::StatefulSession::Options session_options(
     /* 7.7: provision CAPTURE from GBM dma-bufs when the allocator is usable and
      * the device advertises SUPPORTS_DMABUF; the session decides and logs once. */
     options.allocator = allocator;
-    /* VA2e: AV1 emits every reconstructed frame as shown (VA2c 50d4b0a), so the
-     * stateful decoder outputs one frame per decode op -- there is no held
-     * B-frame tail to shake loose mid-stream. Suppress the mid-stream idle/
-     * timeout DEC_CMD_STOP drain (D85/D86): mid-stream it would RESET the
-     * decoder's DPB and break AV1's reference chain, softing the browser off
-     * zero-copy (VA2d). finish() still drains the true tail at EOS. */
+    /* VA3-sync-reorder: NO mid-stream drain for AV1 (correcting VA2e's rationale,
+     * not its setting). VA2e's premise -- "AV1 emits every reconstructed frame as
+     * shown (VA2c 50d4b0a), so there is no held tail" -- was refuted on the phone
+     * (VA2j): the QTI stateful AV1 decoder emits in DECODE order but keeps a
+     * small output-pipeline tail. For libaom/YouTube deep-B-pyramid content the
+     * frame the client next needs to DISPLAY is a late-decoded frame at the
+     * codec's pipeline head, held until one more access unit arrives.
+     * ffmpeg-vaapi (and Firefox) feed in decode order and sync in display order
+     * on a coupled loop: they block on that head frame and cannot feed ahead, so
+     * the codec -- CAPTURE buffers free, OUTPUT queue empty -- is input-starved
+     * and the frame never comes (VA3-sync-reorder instrumented trace: await=10,
+     * qout=0, free_cap=21, submits=10, produced 1..9). The DEC_CMD_STOP drain
+     * cannot rescue it: mid-stream it DROPS the held frame and resets, emitting
+     * only an empty LAST (measured: CAP-DROP seq=0 bytesused=0 last=1, stash
+     * unchanged) -- so a mid-stream drain loses the frame AND breaks the chain.
+     * Both codec-side levers to remove the delay are refuted (VA2k KEY_LOW_LATENCY,
+     * VA2l .low_latency variant), and a VA-API client cannot feed ahead, so the
+     * wedge is NOT resolvable in guest-side libva. Keep the drain off: fail the
+     * one stalled surface (client falls back to software for deep-B AV1) and keep
+     * the session alive for the frames that follow. VP9 has no output-delay tail
+     * (solid 300/300 incl. 854) and YouTube serves VP9, so VP9 is the browser
+     * path for zero-copy. finish() still drains the genuine tail at EOS. */
     options.allow_midstream_drain = false;
     return options;
 }

@@ -30,6 +30,7 @@
  */
 
 #include <chrono>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,68 @@ void test_out_of_order_delivery_and_stash()
     session.submit(6, fake_au());
     session.submit(7, fake_au());
     CHECK_EQ(device.pending_decodes.size(), 4u);
+}
+
+void test_reorder_absorbed_in_any_sync_order()
+{
+    /* VA3-sync-reorder: the reorder-tolerance contract. A stateful codec may
+     * deliver CAPTURE frames in an order that is neither submit order nor the
+     * client's sync order (a deep-B decoder reorders by order_hint; a VA-API
+     * client syncs in display order). The backend keys the stash by the sequence
+     * carried in the OUTPUT timestamp (TIMESTAMP_COPY), so sync(seq) returns THAT
+     * sequence's frame whenever it has been produced, regardless of order, and
+     * releasing recycles the CAPTURE buffer with no leak. The wedge investigation
+     * confirmed this mapping is ALREADY correct -- the deep-B AV1 wedge is an
+     * input-starvation stall (session.h allow_midstream_drain doc), NOT a
+     * mis-delivery. Named mutation this fails under: claim_locked() returning
+     * stash_.begin()->second (the front of the stash / FIFO) instead of
+     * stash_.find(sequence) -- a scrambled sync then gets the wrong frame. */
+    FakeDevice device;
+    device.manual_delivery = true;
+    /* An OUTPUT ring deep enough to hold every submit before the codec produces
+     * anything, so all six sit in the stash when the scrambled syncs begin. */
+    StatefulSession::Options options = fast_options();
+    options.output_ring_size = 8;
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+
+    constexpr int n = 6;
+    for (uint64_t s = 1; s <= n; s++) {
+        session.submit(s, fake_au());
+    }
+
+    /* The codec finishes in a scrambled order. The fake pops CAPTURE indices
+     * (0,1,2,...) in delivery order, so the seq->index mapping is known and the
+     * "right frame" assertion below is exact. */
+    const uint64_t delivery[n] = { 2, 5, 1, 4, 3, 6 };
+    unsigned expected_index[n + 1] = { 0 };
+    for (int i = 0; i < n; i++) {
+        device.deliver(delivery[i]);
+        expected_index[delivery[i]] = static_cast<unsigned>(i);
+    }
+
+    /* The client syncs in yet another order (its display order). Every sync must
+     * return its OWN sequence's frame -- a distinct CAPTURE buffer each time. */
+    const uint64_t sync_order[n] = { 4, 1, 6, 2, 5, 3 };
+    std::vector<StatefulSession::Frame> claimed;
+    std::set<unsigned> seen;
+    for (uint64_t s : sync_order) {
+        StatefulSession::Frame frame;
+        CHECK(session.sync(s, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(frame.index, expected_index[s]); /* the RIGHT frame, not a FIFO front */
+        CHECK(seen.insert(frame.index).second); /* distinct buffers, never handed out twice */
+        claimed.push_back(frame);
+    }
+    CHECK_EQ(session.timeout_recoveries(), 0u);
+    CHECK_EQ(session.idle_drains(), 0u);
+
+    /* No surface leak: releasing every claimed frame returns its CAPTURE buffer
+     * to the device's free pool -- all provisioned buffers (min 4 + share
+     * min(6,8) = 10) are free again. */
+    for (const auto& f : claimed) {
+        session.release_frame(f);
+    }
+    CHECK_EQ(device.capture_count, 10u);
+    CHECK_EQ(device.free_captures.size(), static_cast<size_t>(device.capture_count));
 }
 
 void test_drop_sequence_recycles()
@@ -368,21 +431,24 @@ void test_reenterable_recovery()
 
 void test_midstream_drain_is_codec_aware()
 {
-    /* VA2e: the mid-stream idle/timeout DEC_CMD_STOP drain is H.264-only. AV1
-     * and VP9 emit every access unit as shown, so the decoder outputs one
-     * frame per decode op -- there is no held reorder tail to drain out, and a
-     * mid-stream DEC_CMD_STOP would only reset the DPB and break the reference
-     * chain (VA2d). With Options.allow_midstream_drain = false a stalled sync
-     * must wait out the hard cap and fail THIS surface WITHOUT a DEC_CMD_STOP;
-     * with it true (H.264) the same stall must still drain. finish() drains the
-     * genuine tail at EOS in both. Named mutations this fails under: default
-     * allow_midstream_drain false (H.264 stops draining -- Part B) or drop the
-     * !allow_midstream_drain_ gate in sync() (AV1/VP9 drain and reset again --
-     * Part A). */
+    /* The mid-stream idle/timeout DEC_CMD_STOP drain is H.264-only. VP9 emits
+     * every frame as shown (in-band show_existing_frame), so it never holds a
+     * mid-stream tail. AV1 deep-B DOES hold a decode-order pipeline tail, but a
+     * mid-stream DEC_CMD_STOP cannot rescue it (VA3-sync-reorder): on the device
+     * the drain DROPS the held frame and resets, so draining would only lose the
+     * frame and break the chain -- AV1 keeps the drain OFF and falls back to
+     * software for deep-B, VP9 carries browser zero-copy. With
+     * Options.allow_midstream_drain = false a stalled sync waits out the hard cap
+     * and fails THIS surface WITHOUT a DEC_CMD_STOP; with it true (H.264) the
+     * same stall must still drain (its EOS-shaped tail flushes cleanly). finish()
+     * drains the genuine tail at EOS in both. Named mutations this fails under:
+     * default allow_midstream_drain false (H.264 stops draining -- Part B) or
+     * dropping the !allow_midstream_drain_ gate in sync() (AV1/VP9 drain and
+     * reset again -- Part A). */
 
     /* Part A -- AV1/VP9 (drain suppressed): a mid-stream idle stall issues NO
      * DEC_CMD_STOP; the sync waits out the hard cap and reports a per-surface
-     * decode error, session alive and provisioned, DPB never reset. The
+     * decode error, session alive and provisioned, chain never reset. The
      * on_decoder_stop script would deliver the frame IF a drain fired -- it
      * must never run. */
     {
@@ -677,6 +743,7 @@ int main()
 {
     test_provisioning_and_mapping();
     test_out_of_order_delivery_and_stash();
+    test_reorder_absorbed_in_any_sync_order();
     test_drop_sequence_recycles();
     test_capture_pool_share();
     test_stale_release_after_reprovision();
