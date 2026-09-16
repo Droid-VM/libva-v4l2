@@ -975,8 +975,21 @@ void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferA
     f.show_existing_frame = 0;
     f.frame_type = static_cast<GstAV1FrameType>(frame_type);
     f.frame_is_intra = frame_is_intra;
-    f.show_frame = pic.pic_info_fields.bits.show_frame;
-    f.showable_frame = pic.pic_info_fields.bits.showable_frame;
+    /* Emit every reconstructed frame as shown (VA2c). The stateful V4L2 decoder
+     * yields a CAPTURE frame only when the OBU stream DISPLAYS one (show_frame=1,
+     * or a show_existing_frame), but a stateless-VA client (ffmpeg, Firefox)
+     * drives one vaBeginPicture/EndPicture per CODED frame and expects the
+     * decoded surface back for each -- it does its own display reordering. VA
+     * never carries show_existing_frame, so a random-access stream's non-shown
+     * alt-refs would be decoded but never output, and the client would stall
+     * waiting for a surface the decoder is holding for a show_existing that never
+     * comes (the codec drains after only the shown leaves). Marking every frame
+     * shown makes the decoder emit exactly one output per decode op, in decode
+     * order; show_frame does not affect the decoded samples, and the client
+     * reorders for display. Low-delay / all-intra streams are already all-shown,
+     * so this is a no-op there. showable_frame is then not coded (5.9.2). */
+    f.show_frame = 1;
+    f.showable_frame = 0;
     f.error_resilient_mode = pic.pic_info_fields.bits.error_resilient_mode;
     f.disable_cdf_update = pic.pic_info_fields.bits.disable_cdf_update;
     f.allow_screen_content_tools = pic.pic_info_fields.bits.allow_screen_content_tools;
