@@ -213,6 +213,42 @@ void test_gbm_container_too_small_falls_back_to_mmap()
     CHECK(device.capture_streaming);
 }
 
+void test_non_aligned_resolution_stays_gbm()
+{
+    /* VA2d, THE fix: a non-16-aligned resolution (854x480, where YouTube
+     * starts). The qti decoder pads its luma stride to its own alignment
+     * (bytesperline 1024) and REFUSES to move it (S_FMT non-negotiable), while
+     * GBM rounds a requested R8 width up to 64 B. Asking GBM for the coded
+     * width (856) yields a 896 stride that does not match 1024, so the old code
+     * negotiated S_FMT, was refused, and fell back to MMAP -- no zero-copy
+     * export. The fix requests the bo at the device bytesperline, so GBM
+     * returns a matching 1024 stride and gbm-dmabuf holds with no negotiation.
+     * Named mutation: request capture_format_.width instead of bytesperline ->
+     * the bo stride is 896, S_FMT is refused, and this falls back to MMAP. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.capture_stride_negotiable = false; /* the qti codec will not move its stride */
+    device.scripted_format.width = 856; /* AV1 coded width of a 854 frame */
+    device.scripted_format.height = 480;
+    device.scripted_format.bytesperline = 1024; /* luma stride, padded past 854/856 */
+    device.scripted_format.sizeimage = 1024u * 480u * 3u / 2u; /* 737280 */
+    device.scripted_format.num_planes = 1;
+    FakeAllocator allocator;
+    allocator.align_stride_to_width = true; /* model GBM: stride = align_up(width, 64) */
+    allocator.align_stride = 64;
+    StatefulSession session(device, 0x34363248, 854, 480, gbm_options(&allocator));
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
+    CHECK(device.capture_dmabuf);
+    /* The whole point: no S_FMT negotiation was needed because the bo was asked
+     * for at the device bytesperline, so its stride matched on the first try. */
+    CHECK_EQ(device.set_capture_stride_calls, 0u);
+    /* The session requested the device luma stride (1024), NOT the coded width
+     * (856) GBM would have rounded to a mismatching 896. */
+    CHECK_EQ(allocator.last_width, 1024u);
+}
+
 void test_gbm_allocation_failure_falls_back()
 {
     /* A mid-pool allocation failure unwinds cleanly to MMAP. */
@@ -479,6 +515,7 @@ int main()
     test_stride_negotiated_then_gbm();
     test_stride_refused_falls_back_to_mmap();
     test_gbm_container_too_small_falls_back_to_mmap();
+    test_non_aligned_resolution_stays_gbm();
     test_gbm_allocation_failure_falls_back();
     test_dmabuf_qbuf_eio_falls_back_to_mmap_and_decodes();
     test_dmabuf_qbuf_einval_also_falls_back();

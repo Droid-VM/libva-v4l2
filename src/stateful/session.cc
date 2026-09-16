@@ -364,19 +364,52 @@ void StatefulSession::provision_capture_mmap_locked(unsigned count)
 
 bool StatefulSession::provision_capture_gbm_locked(unsigned count)
 {
-    const uint32_t width = capture_format_.width;
+    /* VA2d: size the R8 container's WIDTH from the device's luma stride
+     * (bytesperline), not the coded/visible width. GBM rounds an R8 width up
+     * to its own row alignment (64 B on Adreno); the device pads its
+     * bytesperline to the codec's own, usually larger, alignment. At a
+     * 16-aligned resolution the two happen to agree (1920 == 1920, the spike's
+     * only case), but at 854x480 -- where YouTube starts -- the qti decoder
+     * reports a bytesperline padded well past 854 while GBM, asked for the
+     * smaller coded width, returns a stride that need not match it; the codec
+     * then refuses to move its stride (S_FMT below), so every non-16-aligned
+     * resolution fell back to MMAP and lost the VA3 zero-copy export -- Firefox
+     * on YouTube dropped to software dav1d at decode-order frame 1. Requesting
+     * the bo at bytesperline makes the R8 stride come back == bytesperline
+     * whenever bytesperline is a multiple of GBM's row alignment -- which every
+     * Qualcomm codec stride is -- so gbm-dmabuf holds at every resolution and
+     * the S_FMT negotiation is only a safety net for a genuinely odd device
+     * (7.7 point 1). The container's height is still the coded height, so its
+     * chroma plane and its size (sizeimage guard below) are unchanged. */
+    const uint32_t alloc_width
+        = capture_format_.bytesperline != 0 ? capture_format_.bytesperline : capture_format_.width;
     const uint32_t height = capture_format_.height;
 
     /* Allocate the first bo to learn the stride, and negotiate it against the
-     * device's G_FMT bytesperline (7.7 point 1). The spike found them equal
-     * (1920 == 1920); a mismatch is a rare S_FMT(CAPTURE), and if the device
-     * refuses we free the bo and fall back to MMAP. */
+     * device's G_FMT bytesperline (7.7 point 1). With alloc_width == bytesperline
+     * they now agree by construction; a residual mismatch (bytesperline not
+     * GBM-aligned) is a rare S_FMT(CAPTURE), and if the device refuses we free
+     * the bo and fall back to MMAP. */
     uint32_t stride = 0;
-    auto first = allocator_->allocate(width, height, stride);
+    auto first = allocator_->allocate(alloc_width, height, stride);
     if (!first) {
         log("stateful surfaces: mmap (reason: GBM allocation failed)");
         return false;
     }
+
+    /* Record the exact geometry the fallback ladder turns on, so a phone run at
+     * a non-aligned resolution shows the stride/bytesperline divergence without
+     * a debug build (VA2d). */
+    {
+        char probe[240];
+        snprintf(probe, sizeof(probe),
+            "stateful surfaces: gbm probe -- G_FMT %ux%u bytesperline %u sizeimage %u planes %u; R8 request width %u "
+            "-> bo stride %u, container %zu",
+            capture_format_.width, capture_format_.height, capture_format_.bytesperline, capture_format_.sizeimage,
+            capture_format_.num_planes, alloc_width, stride, first->size());
+        log(probe);
+    }
+
     if (stride != capture_format_.bytesperline) {
         uint32_t granted = device_.set_capture_stride(stride);
         if (granted != stride) {
@@ -414,7 +447,7 @@ bool StatefulSession::provision_capture_gbm_locked(unsigned count)
     capture_bos_.push_back(std::move(first));
     for (unsigned i = 1; i < count; i++) {
         uint32_t s = 0;
-        auto bo = allocator_->allocate(width, height, s);
+        auto bo = allocator_->allocate(alloc_width, height, s);
         if (!bo || s != stride) {
             log("stateful surfaces: mmap (reason: a later GBM allocation failed or changed stride)");
             capture_bos_.clear();

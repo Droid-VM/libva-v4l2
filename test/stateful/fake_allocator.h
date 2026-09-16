@@ -80,9 +80,19 @@ public:
     bool nv12_linear = false;
     uint32_t stride = 1920; /* what allocate() reports; set != device bytesperline to force S_FMT */
     int fail_after = -1; /* >= 0: the Nth allocate() (0-based) fails, modelling a mid-pool failure */
+    /* VA2d: model real GBM, which rounds the requested R8 width UP to its own
+     * row alignment and reports that as the stride. With this on, the stride is
+     * derived from the width the session asks for (align_stride bytes) rather
+     * than the fixed `stride` above, so a test can prove the session asks for
+     * the device bytesperline (a 16-aligned resolution's aligned stride) rather
+     * than the coded/visible width, which GBM would round to a different, wrong
+     * stride. */
+    bool align_stride_to_width = false;
+    uint32_t align_stride = 64;
 
     /* --- observable --- */
     unsigned allocations = 0;
+    uint32_t last_width = 0; /* the width of the most recent allocate() request */
 
     bool usable() const override { return is_usable; }
     bool supports_nv12_linear() const override { return nv12_linear; }
@@ -90,13 +100,18 @@ public:
 
     std::unique_ptr<stateful::SurfaceBuffer> allocate(uint32_t width, uint32_t height, uint32_t& stride_out) override
     {
+        last_width = width;
         if (fail_after >= 0 && static_cast<int>(allocations) >= fail_after) {
             allocations += 1;
             return nullptr;
         }
         allocations += 1;
-        stride_out = stride;
-        std::size_t size = static_cast<std::size_t>(stride) * (height + height / 2);
-        return std::make_unique<FakeSurfaceBuffer>(stride, size);
+        uint32_t bo_stride = stride;
+        if (align_stride_to_width) {
+            bo_stride = align_stride > 0 ? ((width + align_stride - 1) / align_stride) * align_stride : width;
+        }
+        stride_out = bo_stride;
+        std::size_t size = static_cast<std::size_t>(bo_stride) * (height + height / 2);
+        return std::make_unique<FakeSurfaceBuffer>(bo_stride, size);
     }
 };
