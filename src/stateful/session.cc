@@ -309,11 +309,22 @@ void StatefulSession::handle_source_change_locked()
     const unsigned min_buffers = std::max(device_.min_buffers_for_capture(), 1);
 
     if (capture_mode_ == CaptureMode::gbm_dmabuf) {
-        /* 7.7 point 2: with DMABUF the client owns the buffers, so a surface
-         * is a buffer; request max(num_surfaces, codec minimum), capped at 32.
-         * When the minimum exceeds the surface count the extra bos are cheap
-         * internal spares so the codec always has its minimum. */
-        unsigned count = std::min(std::max(num_surfaces_, min_buffers), kMaxCaptureBuffers);
+        /* 7.7 point 2: with DMABUF the client owns the buffers, so a surface is
+         * a buffer. The pool must cover the codec's own minimum working set AND
+         * the surfaces the client holds concurrently (its reorder/compositing
+         * queue) -- the same headroom the MMAP path adds below (7.6 point 4).
+         * The shipped max(num_surfaces, min) gave the codec exactly its minimum
+         * whenever the client made fewer surfaces than that -- ffmpeg-VAAPI
+         * makes ~10 for AV1 against a min of 21 -- so a reorder-heavy AV1 stream
+         * starved: the client's held surfaces came out of the codec's own
+         * slots, the codec stalled waiting for one back, and the 50 ms idle
+         * drain fired mid-stream into a failed sync (D85/D86). VA2d measured
+         * 854x480 random-access AV1 truncating in gbm (~1 run in 3) where the
+         * min+share MMAP pool was solid; H.264/VP9, with almost no reorder,
+         * never starved. Mirror MMAP: min + share, and at least num_surfaces so
+         * a client that made MORE still gets a bo per surface. */
+        const unsigned gbm_share = std::min(num_surfaces_, kPoolShareCap);
+        unsigned count = std::min(std::max(num_surfaces_, min_buffers + gbm_share), kMaxCaptureBuffers);
         if (provision_capture_gbm_locked(count)) {
             provisioned_ = true;
             cv_.notify_all();

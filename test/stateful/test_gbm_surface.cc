@@ -149,9 +149,10 @@ void test_gbm_mode_when_capable()
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
     CHECK(device.capture_dmabuf);
     CHECK_EQ(device.set_capture_stride_calls, 0u); /* strides matched, no negotiation */
-    /* count = max(surfaces 6, min 4) = 6 (7.7 point 2). */
-    CHECK_EQ(device.capture_count, 6u);
-    CHECK_EQ(allocator.allocations, 6u);
+    /* count = max(surfaces 6, min 4 + share min(6,8)=6 = 10) = 10 (7.7 point 2:
+     * the codec's minimum plus the client's held-surface headroom). */
+    CHECK_EQ(device.capture_count, 10u);
+    CHECK_EQ(allocator.allocations, 10u);
 }
 
 void test_stride_negotiated_then_gbm()
@@ -342,8 +343,8 @@ void test_dmabuf_qbuf_einval_also_falls_back()
 
 void test_spares_when_min_exceeds_surfaces()
 {
-    /* Fewer surfaces than the codec minimum: the pool is the minimum, the
-     * extra bos are internal spares (7.7 point 2). */
+    /* Fewer surfaces than the codec minimum: the pool is min + share, and the
+     * bos beyond the client's surfaces are internal spares (7.7 point 2). */
     FakeDevice device;
     device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
     device.scripted_min_buffers = 10;
@@ -354,8 +355,9 @@ void test_spares_when_min_exceeds_surfaces()
 
     decode_one(session, 1);
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
-    CHECK_EQ(device.capture_count, 10u); /* max(2, 10) */
-    CHECK_EQ(allocator.allocations, 10u);
+    /* max(surfaces 2, min 10 + share min(2,8)=2 = 12) = 12. */
+    CHECK_EQ(device.capture_count, 12u);
+    CHECK_EQ(allocator.allocations, 12u);
 }
 
 /* --- DMABUF QBUF plane fields (7.7 point 2/5b) --- */
