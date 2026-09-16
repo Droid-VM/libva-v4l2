@@ -39,6 +39,7 @@ extern "C" {
 #include "buffer.h"
 #include "driver.h"
 #include "format.h"
+#include "stateful/av1_context.h"
 #include "stateful/frame_view.h"
 #include "stateful/h264_context.h"
 #include "stateful/vp9_context.h"
@@ -68,6 +69,9 @@ std::optional<stateful::FrameView> stateful_frame_view(const Surface& surface)
     }
     if (auto* vp9 = dynamic_cast<StatefulVP9Context*>(context)) {
         return vp9->frame_view(surface);
+    }
+    if (auto* av1 = dynamic_cast<StatefulAV1Context*>(context)) {
+        return av1->frame_view(surface);
     }
     return std::nullopt;
 }

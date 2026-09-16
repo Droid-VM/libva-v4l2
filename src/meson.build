@@ -53,6 +53,8 @@ sources = [
 	'stateful/h264_context.cc',
 	'stateful/vp9_bitstream.cc',
 	'stateful/vp9_context.cc',
+	'stateful/av1_bitstream.cc',
+	'stateful/av1_context.cc',
 	'stateful/gbm_allocator.cc',
 ]
 
@@ -81,6 +83,9 @@ headers = [
 	'stateful/frame_view.h',
 	'stateful/vp9_bitstream.h',
 	'stateful/vp9_context.h',
+	'stateful/gstav1bitwriter_compat.h',
+	'stateful/av1_bitstream.h',
+	'stateful/av1_context.h',
 	'stateful/allocator.h',
 	'stateful/gbm_allocator.h',
 	'stateful/prime_descriptor.h',
@@ -134,6 +139,19 @@ test_vp9_context = executable('test_vp9_context',
 	cpp_args: cpp_args,
 	dependencies: [ libva_dep, kernel_dep ])
 test('vp9-context', test_vp9_context)
+
+# VA2b (VPU_DESIGN.md 7.6; VA2-survey (C)): the AV1 OBU re-synthesis. The
+# Av1AccessUnitBuilder rebuilds temporal_delimiter + sequence_header +
+# frame_header + tile_group OBUs from VADecPictureParameterBufferAV1; the test
+# drives real parsed AV1 frames through the ffmpeg-shaped VA fill and asserts the
+# produced OBU stream parses back with the GStreamer AV1 parser (and covers the
+# tile-group wrapper, LEB128, and the loop_restoration lr_unit_shift fix). Needs
+# libgstcodecparsers for the gst AV1 structs and bit writer.
+test_av1_bitstream = executable('test_av1_bitstream',
+	[ '../test/stateful/test_av1_bitstream.cc', 'stateful/av1_bitstream.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, libgstcodecparsers_dep, kernel_dep ])
+test('av1-bitstream', test_av1_bitstream)
 
 test_session = executable('test_stateful_session',
 	[ '../test/stateful/test_session.cc', 'stateful/session.cc' ],
