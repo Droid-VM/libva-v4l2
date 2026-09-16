@@ -168,6 +168,59 @@ void test_stride_negotiated_then_gbm()
     decode_one(session, 1);
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
     CHECK_EQ(device.set_capture_stride_calls, 1u);
+    /* The device adopted the bo stride, so the session re-read it: the QBUF
+     * offsets and the export descriptor now describe the planes at 2048, which
+     * is exactly the bo's own stride -- the only geometry turnip imports. */
+    CHECK_EQ(session.capture_format().bytesperline, 2048u);
+}
+
+void test_non_aligned_resolution_negotiates_stride()
+{
+    /* VA2g, THE 854x480 zero-copy fix. The phone measurement (VA2g §investigation)
+     * settled the ambiguity VA2d left open: c2.qti.av1.decoder genuinely emits a
+     * TIGHT 854-byte NV12 (KEY_STRIDE 854, MediaImage2 row_inc 854, buffer 614880),
+     * so the data is really at an 854 pitch -- there is no aligned MediaCodec
+     * stride to "report". GBM must round the R8 container to its 64 B row
+     * alignment (854 -> 896), and turnip's dma-buf EGLImage import rejects an
+     * export pitch (854) that is not the bo's own stride (896) -> EGL_BAD_ALLOC ->
+     * YouTube drops to dav1d. VA2d's slack path (keep bytesperline 854, export
+     * 854 into a 896 bo) is bit-exact for the CPU download but is exactly the
+     * pitch turnip refuses. The fix pads on the DEVICE side: S_FMT(CAPTURE) now
+     * adopts the bo's 64-aligned luma stride (the crosvm android backend already
+     * copies row by row, so it writes each 854-wide row into a 896-stride slot),
+     * and this libva path -- unchanged since it was written -- negotiates that
+     * stride and re-reads it, so the export pitch, the bo stride and the data's
+     * row pitch are all 896 and the visible 854 rides as the surface width/crop.
+     * This models the padded device: negotiable stride, tight 854 geometry, a bo
+     * GBM rounds to 896. Named mutation: drop the `granted == stride` re-read in
+     * provision_capture_gbm_locked -> the export keeps the tight 854 pitch and
+     * this assertion fails. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.capture_stride_negotiable = true; /* the padded device adopts the bo stride */
+    device.scripted_format.width = 854;
+    device.scripted_format.height = 480;
+    device.scripted_format.bytesperline = 854; /* tight: MediaCodec's real KEY_STRIDE at 854 */
+    device.scripted_format.sizeimage = 854u * 480u * 3u / 2u; /* 614880 */
+    device.scripted_format.num_planes = 1;
+    FakeAllocator allocator;
+    allocator.align_stride_to_width = true; /* model GBM: stride = align_up(width, 64) */
+    allocator.align_stride = 64; /* align_up(854, 64) = 896 */
+    StatefulSession session(device, 0x31305641, 854, 480, gbm_options(&allocator));
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
+    /* S_FMT was tried once (bo stride 896 != device 854) and GRANTED (unlike the
+     * pre-VA2g qti codec, the padded device widens). */
+    CHECK_EQ(device.set_capture_stride_calls, 1u);
+    /* The bo was requested at the tight device stride (854); GBM's 64 B rounding
+     * gives 896. */
+    CHECK_EQ(allocator.last_width, 854u);
+    /* The negotiated geometry is adopted: bytesperline == the bo's 896 stride, so
+     * the QBUF plane offsets and the exported descriptor use 896 -- the pitch that
+     * equals the bo's real stride AND the data's row pitch, which is what the GPU
+     * importer requires. */
+    CHECK_EQ(session.capture_format().bytesperline, 896u);
 }
 
 void test_narrow_bo_stride_refused_falls_back_to_mmap()
@@ -486,6 +539,34 @@ void test_prime_descriptor_separate()
     CHECK_EQ(desc.layers[1].pitch[0], 1280u);
 }
 
+void test_prime_descriptor_non_aligned_pitch()
+{
+    /* VA2g: a non-16-aligned visible width (854x480, YouTube's 480p rendition)
+     * exported through the padded-device fix. The stride passed to the
+     * descriptor is the bo's 64-aligned luma stride (896) -- the value the
+     * device now writes at and the value turnip's dma-buf importer demands --
+     * while the descriptor width stays the visible 854 (turnip crops to it).
+     * Both plane pitches and the chroma offset ride the 896 stride, NOT the 854
+     * visible width. This is the export contract the whole VA2g chain relies on:
+     * pitch == bo stride == data row pitch, width == crop. Named mutation: make
+     * fill_nv12_prime_descriptor derive the pitch or the chroma offset from
+     * `width` instead of `stride` -> these checks fail. */
+    VADRMPRIMESurfaceDescriptor desc;
+    stateful::fill_nv12_prime_descriptor(&desc, 11, 854, 480, 896, 896u * 720u, 0);
+
+    CHECK_EQ(desc.width, 854u); /* the visible crop, not the padded stride */
+    CHECK_EQ(desc.height, 480u);
+    CHECK_EQ(desc.num_objects, 1u);
+    CHECK_EQ(desc.objects[0].size, 896u * 720u);
+    CHECK_EQ(desc.num_layers, 1u);
+    CHECK_EQ(desc.layers[0].drm_format, static_cast<uint32_t>(DRM_FORMAT_NV12));
+    CHECK_EQ(desc.layers[0].num_planes, 2u);
+    CHECK_EQ(desc.layers[0].offset[0], 0u);
+    CHECK_EQ(desc.layers[0].offset[1], 896u * 480u); /* chroma at stride*height, not width*height */
+    CHECK_EQ(desc.layers[0].pitch[0], 896u); /* luma pitch == bo stride */
+    CHECK_EQ(desc.layers[0].pitch[1], 896u); /* chroma pitch == bo stride */
+}
+
 /* --- the export gate (7.7 point 3): before sync -> SURFACE_BUSY --- */
 
 void test_export_gate()
@@ -548,6 +629,7 @@ int main()
     test_env_forces_mmap();
     test_gbm_mode_when_capable();
     test_stride_negotiated_then_gbm();
+    test_non_aligned_resolution_negotiates_stride();
     test_narrow_bo_stride_refused_falls_back_to_mmap();
     test_wider_bo_stride_refused_stays_gbm();
     test_gbm_container_too_small_falls_back_to_mmap();
@@ -561,6 +643,7 @@ int main()
     test_capture_buffer_map_roundtrip();
     test_prime_descriptor_composed();
     test_prime_descriptor_separate();
+    test_prime_descriptor_non_aligned_pitch();
     test_export_gate();
     test_derive_unavailable_message();
     test_mmap_mode_unaffected();

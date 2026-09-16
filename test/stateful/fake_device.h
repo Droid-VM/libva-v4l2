@@ -212,7 +212,20 @@ public:
     {
         check_alive();
         set_capture_stride_calls += 1;
-        return capture_stride_negotiable ? bytesperline : scripted_format.bytesperline;
+        if (!capture_stride_negotiable) {
+            return scripted_format.bytesperline;
+        }
+        /* Model a real S_FMT(CAPTURE) that adopts a padded luma stride (VA2g):
+         * the granted stride becomes the geometry a subsequent G_FMT reports,
+         * so the session's "re-read the negotiated geometry" sees the wider
+         * bytesperline AND the matching sizeimage. Before VA2g the fake granted
+         * the stride but left scripted_format untouched, so capture_format()
+         * kept reporting the tight stride and the negotiated-then-gbm path was
+         * only checked by its call count -- test_non_aligned_resolution_
+         * negotiates_stride now asserts the adopted geometry. */
+        scripted_format.bytesperline = bytesperline;
+        scripted_format.sizeimage = bytesperline * (scripted_format.height + scripted_format.height / 2);
+        return bytesperline;
     }
 
     unsigned request_capture_buffers_dmabuf(unsigned count) override
