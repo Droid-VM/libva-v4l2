@@ -365,31 +365,16 @@ void StatefulSession::provision_capture_mmap_locked(unsigned count)
 bool StatefulSession::provision_capture_gbm_locked(unsigned count)
 {
     /* VA2d: size the R8 container's WIDTH from the device's luma stride
-     * (bytesperline), not the coded/visible width. GBM rounds an R8 width up
-     * to its own row alignment (64 B on Adreno); the device pads its
-     * bytesperline to the codec's own, usually larger, alignment. At a
-     * 16-aligned resolution the two happen to agree (1920 == 1920, the spike's
-     * only case), but at 854x480 -- where YouTube starts -- the qti decoder
-     * reports a bytesperline padded well past 854 while GBM, asked for the
-     * smaller coded width, returns a stride that need not match it; the codec
-     * then refuses to move its stride (S_FMT below), so every non-16-aligned
-     * resolution fell back to MMAP and lost the VA3 zero-copy export -- Firefox
-     * on YouTube dropped to software dav1d at decode-order frame 1. Requesting
-     * the bo at bytesperline makes the R8 stride come back == bytesperline
-     * whenever bytesperline is a multiple of GBM's row alignment -- which every
-     * Qualcomm codec stride is -- so gbm-dmabuf holds at every resolution and
-     * the S_FMT negotiation is only a safety net for a genuinely odd device
-     * (7.7 point 1). The container's height is still the coded height, so its
-     * chroma plane and its size (sizeimage guard below) are unchanged. */
+     * (bytesperline), so GBM's own R8 pitch cannot come out NARROWER than the
+     * device needs -- align_up(bytesperline, GBM row alignment) >= bytesperline.
+     * The height is the coded height, so the container's chroma plane and its
+     * size are the device's. */
     const uint32_t alloc_width
         = capture_format_.bytesperline != 0 ? capture_format_.bytesperline : capture_format_.width;
     const uint32_t height = capture_format_.height;
 
-    /* Allocate the first bo to learn the stride, and negotiate it against the
-     * device's G_FMT bytesperline (7.7 point 1). With alloc_width == bytesperline
-     * they now agree by construction; a residual mismatch (bytesperline not
-     * GBM-aligned) is a rare S_FMT(CAPTURE), and if the device refuses we free
-     * the bo and fall back to MMAP. */
+    /* Allocate the first bo to learn its GBM stride and reconcile it with the
+     * device's G_FMT bytesperline (7.7 point 1). */
     uint32_t stride = 0;
     auto first = allocator_->allocate(alloc_width, height, stride);
     if (!first) {
@@ -411,28 +396,55 @@ bool StatefulSession::provision_capture_gbm_locked(unsigned count)
     }
 
     if (stride != capture_format_.bytesperline) {
+        /* The bo's GBM stride differs from the device's luma stride. First ask
+         * the device to adopt the bo stride via S_FMT(CAPTURE): if it agrees the
+         * codec writes bo-stride-packed NV12 and the whole bo width is used. */
         uint32_t granted = device_.set_capture_stride(stride);
-        if (granted != stride) {
-            char line[176];
+        if (granted == stride) {
+            capture_format_ = device_.capture_format(); /* re-read the negotiated geometry */
+        } else if (stride > capture_format_.bytesperline) {
+            /* VA2d, THE fix: at 854x480 the qti decoder emits a tightly-packed
+             * 854-byte luma stride and will NOT grow it (S_FMT granted 854),
+             * while GBM rounds an R8 width up to its 64-byte row alignment and
+             * cannot produce a 854 stride (it returns 896). That is still fine
+             * for zero-copy: the codec writes its own bytesperline-packed NV12
+             * (854) into the roomier bo, and both the DMABUF QBUF plane offsets
+             * and the exported VADRMPRIMESurfaceDescriptor already describe the
+             * planes at the device bytesperline -- the bo's extra bytes per row
+             * are unused slack. Keep the device geometry (bytesperline stays
+             * 854) and proceed; the sizeimage guard below confirms the bo holds
+             * a bytesperline-strided frame (it does: 896*720 > 854*480*3/2).
+             * Before this, every such resolution fell back to MMAP and lost the
+             * export, so Firefox on YouTube dropped to software dav1d at
+             * decode-order frame 1 (7.7 point 1). */
+            char line[208];
             snprintf(line, sizeof(line),
-                "stateful surfaces: mmap (reason: GBM stride %u != device bytesperline %u and S_FMT granted %u)",
-                stride, capture_format_.bytesperline, granted);
+                "stateful surfaces: gbm bo stride %u > device bytesperline %u (S_FMT kept %u) -- using the device "
+                "stride, %u B/row slack",
+                stride, capture_format_.bytesperline, granted, stride - capture_format_.bytesperline);
+            log(line);
+        } else {
+            /* stride < bytesperline: the bo is too NARROW to hold a
+             * bytesperline-strided frame row-for-row (should not happen now the
+             * bo is requested at bytesperline, but guard it). Fall back to MMAP. */
+            char line[192];
+            snprintf(line, sizeof(line),
+                "stateful surfaces: mmap (reason: GBM stride %u < device bytesperline %u and S_FMT granted %u)", stride,
+                capture_format_.bytesperline, granted);
             log(line);
             return false;
         }
-        capture_format_ = device_.capture_format(); /* re-read the negotiated geometry */
     }
 
-    /* 7.7 (2): the geometry the R8 container was sized from is the VA
-     * width/height; reconcile it with the device's negotiated G_FMT before
-     * committing to DMABUF. The stride matched (or was negotiated) above; the
-     * remaining check is that each bo actually holds the device's sizeimage --
-     * the decoder writes sizeimage bytes into the buffer, so a bo smaller than
-     * that (unusual padding/alignment, or a height that grew on re-read) would
-     * be an out-of-bounds write. On the phone the R8 container (3112960) is a
-     * touch larger than sizeimage (3110400) so this passes; a shortfall frees
-     * the bos and falls back to MMAP rather than hand the codec a short
-     * buffer. */
+    /* 7.7 (2): the stride was matched, negotiated, or accepted as slack above;
+     * the remaining check is that each bo actually holds a bytesperline-strided
+     * frame -- the decoder writes sizeimage bytes into the buffer, so a bo
+     * smaller than that (a stride shortfall, or a height that grew on re-read)
+     * would be an out-of-bounds write. At 1080p the R8 container (3112960) is a
+     * touch larger than sizeimage (3110400); at 854x480 the 896-strided
+     * container (645120) clears the 854-strided sizeimage (614880) with room to
+     * spare. A shortfall frees the bos and falls back to MMAP rather than hand
+     * the codec a short buffer. */
     if (capture_format_.sizeimage != 0 && first->size() < capture_format_.sizeimage) {
         char line[176];
         snprintf(line, sizeof(line),
@@ -477,11 +489,12 @@ bool StatefulSession::provision_capture_gbm_locked(unsigned count)
     generation_ += 1; /* D83 */
 
     const unsigned spares = capture_count_ > num_surfaces_ ? capture_count_ - num_surfaces_ : 0;
-    char line[200];
+    char line[208];
     snprintf(line, sizeof(line),
         "stateful surfaces: gbm-dmabuf (%s, stride %u, planes %u); CAPTURE pool: %u (surfaces %u, spares %u, min %u)",
-        allocator_->supports_nv12_linear() ? "NV12" : "R8 container", stride, capture_format_.num_planes,
-        capture_count_, num_surfaces_, spares, std::max(device_.min_buffers_for_capture(), 1));
+        allocator_->supports_nv12_linear() ? "NV12" : "R8 container", capture_format_.bytesperline,
+        capture_format_.num_planes, capture_count_, num_surfaces_, spares,
+        std::max(device_.min_buffers_for_capture(), 1));
     log(line);
 
     /* RUNTIME fallback (D90): the r24 driver grants REQBUFS(CAPTURE,DMABUF)

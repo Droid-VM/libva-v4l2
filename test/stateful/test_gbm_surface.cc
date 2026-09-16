@@ -169,16 +169,21 @@ void test_stride_negotiated_then_gbm()
     CHECK_EQ(device.set_capture_stride_calls, 1u);
 }
 
-void test_stride_refused_falls_back_to_mmap()
+void test_narrow_bo_stride_refused_falls_back_to_mmap()
 {
-    /* bo stride differs and the device refuses S_FMT -> MMAP (7.7 point 1).
-     * Named mutation: make provision_capture_gbm_locked ignore the granted !=
-     * requested check -> it proceeds in gbm with a wrong stride. */
+    /* The one stride case that still cannot do zero-copy: the bo is NARROWER
+     * than the device's luma stride (a bo of 1600 for a 1920 bytesperline) and
+     * the device refuses S_FMT, so the codec's 1920-packed rows would not fit
+     * the bo row-for-row -- fall back to MMAP (7.7 point 1). (A bo WIDER than
+     * bytesperline is fine and stays gbm-dmabuf; see
+     * test_non_aligned_resolution_stays_gbm.) Named mutation: drop the
+     * `stride < bytesperline` MMAP branch -> it proceeds in gbm with a bo that
+     * cannot hold the frame. */
     FakeDevice device;
     device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
     device.capture_stride_negotiable = false;
     FakeAllocator allocator;
-    allocator.stride = 2048;
+    allocator.stride = 1600; /* < bytesperline 1920 */
     StatefulSession session(device, 0x34363248, 1920, 1088, gbm_options(&allocator));
 
     decode_one(session, 1);
@@ -188,6 +193,28 @@ void test_stride_refused_falls_back_to_mmap()
     /* The device's MMAP pool was provisioned instead. */
     CHECK(device.capture_streaming);
     CHECK_EQ(device.capture_count, 10u); /* min 4 + share 6 */
+}
+
+void test_wider_bo_stride_refused_stays_gbm()
+{
+    /* A bo WIDER than the device stride with S_FMT refused: the aligned-1088
+     * shape from the spike, but with a bo GBM padded past the device's 1920
+     * (2048) and a codec that will not grow. Zero-copy still holds -- the codec
+     * writes 1920-packed into the 2048-wide bo and the descriptor uses 1920.
+     * This is the general form of the 854x480 fix at an otherwise ordinary
+     * resolution. */
+    FakeDevice device;
+    device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    device.capture_stride_negotiable = false;
+    FakeAllocator allocator;
+    allocator.stride = 2048; /* > bytesperline 1920 */
+    StatefulSession session(device, 0x34363248, 1920, 1088, gbm_options(&allocator));
+
+    decode_one(session, 1);
+    CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
+    CHECK(device.capture_dmabuf);
+    CHECK_EQ(device.set_capture_stride_calls, 1u);
+    CHECK_EQ(session.capture_format().bytesperline, 1920u); /* device stride kept */
 }
 
 void test_gbm_container_too_small_falls_back_to_mmap()
@@ -216,37 +243,43 @@ void test_gbm_container_too_small_falls_back_to_mmap()
 void test_non_aligned_resolution_stays_gbm()
 {
     /* VA2d, THE fix: a non-16-aligned resolution (854x480, where YouTube
-     * starts). The qti decoder pads its luma stride to its own alignment
-     * (bytesperline 1024) and REFUSES to move it (S_FMT non-negotiable), while
-     * GBM rounds a requested R8 width up to 64 B. Asking GBM for the coded
-     * width (856) yields a 896 stride that does not match 1024, so the old code
-     * negotiated S_FMT, was refused, and fell back to MMAP -- no zero-copy
-     * export. The fix requests the bo at the device bytesperline, so GBM
-     * returns a matching 1024 stride and gbm-dmabuf holds with no negotiation.
-     * Named mutation: request capture_format_.width instead of bytesperline ->
-     * the bo stride is 896, S_FMT is refused, and this falls back to MMAP. */
+     * starts). The phone's qti decoder emits a tightly-packed 854-byte luma
+     * stride (bytesperline == the visible width, no padding) and REFUSES to
+     * grow it (S_FMT granted 854), while GBM rounds an R8 width up to its 64 B
+     * row alignment and cannot produce a 854 stride -- it returns 896. So the
+     * bo is WIDER than the device needs. The old code required stride ==
+     * bytesperline (or a granted S_FMT) and fell back to MMAP on the refusal,
+     * losing zero-copy export. The fix accepts the wider bo: the codec writes
+     * its 854-packed NV12 into the roomier container and the export descriptor
+     * describes the planes at bytesperline (the extra 42 B/row is slack). Named
+     * mutation: turn the `stride > bytesperline` slack branch back into
+     * `return false` -> this falls back to MMAP as before. */
     FakeDevice device;
     device.capture_caps = V4L2_BUF_CAP_SUPPORTS_MMAP | V4L2_BUF_CAP_SUPPORTS_DMABUF;
     device.capture_stride_negotiable = false; /* the qti codec will not move its stride */
-    device.scripted_format.width = 856; /* AV1 coded width of a 854 frame */
+    device.scripted_format.width = 854;
     device.scripted_format.height = 480;
-    device.scripted_format.bytesperline = 1024; /* luma stride, padded past 854/856 */
-    device.scripted_format.sizeimage = 1024u * 480u * 3u / 2u; /* 737280 */
+    device.scripted_format.bytesperline = 854; /* tightly packed: stride == width */
+    device.scripted_format.sizeimage = 854u * 480u * 3u / 2u; /* 614880 */
     device.scripted_format.num_planes = 1;
     FakeAllocator allocator;
     allocator.align_stride_to_width = true; /* model GBM: stride = align_up(width, 64) */
-    allocator.align_stride = 64;
+    allocator.align_stride = 64; /* align_up(854, 64) = 896 */
     StatefulSession session(device, 0x34363248, 854, 480, gbm_options(&allocator));
 
     decode_one(session, 1);
     CHECK(session.capture_mode() == StatefulSession::CaptureMode::gbm_dmabuf);
     CHECK(device.capture_dmabuf);
-    /* The whole point: no S_FMT negotiation was needed because the bo was asked
-     * for at the device bytesperline, so its stride matched on the first try. */
-    CHECK_EQ(device.set_capture_stride_calls, 0u);
-    /* The session requested the device luma stride (1024), NOT the coded width
-     * (856) GBM would have rounded to a mismatching 896. */
-    CHECK_EQ(allocator.last_width, 1024u);
+    /* S_FMT was tried once (the bo stride 896 != device 854) and refused; the
+     * session accepted the wider bo as slack rather than falling back. */
+    CHECK_EQ(device.set_capture_stride_calls, 1u);
+    /* The bo was requested at the device bytesperline (854), so GBM's 64 B
+     * rounding gives 896 -- wide enough to hold the 854-strided frame. */
+    CHECK_EQ(allocator.last_width, 854u);
+    /* The device geometry is KEPT (bytesperline stays 854, not the bo's 896),
+     * so the QBUF offsets and the export descriptor use the codec's real
+     * stride. */
+    CHECK_EQ(session.capture_format().bytesperline, 854u);
 }
 
 void test_gbm_allocation_failure_falls_back()
@@ -513,7 +546,8 @@ int main()
     test_env_forces_mmap();
     test_gbm_mode_when_capable();
     test_stride_negotiated_then_gbm();
-    test_stride_refused_falls_back_to_mmap();
+    test_narrow_bo_stride_refused_falls_back_to_mmap();
+    test_wider_bo_stride_refused_stays_gbm();
     test_gbm_container_too_small_falls_back_to_mmap();
     test_non_aligned_resolution_stays_gbm();
     test_gbm_allocation_failure_falls_back();
