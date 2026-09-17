@@ -56,28 +56,26 @@ stateful::StatefulSession::Options session_options(
     /* 7.7: provision CAPTURE from GBM dma-bufs when the allocator is usable and
      * the device advertises SUPPORTS_DMABUF; the session decides and logs once. */
     options.allocator = allocator;
-    /* VA3-sync-reorder: NO mid-stream drain for AV1 (correcting VA2e's rationale,
-     * not its setting). VA2e's premise -- "AV1 emits every reconstructed frame as
-     * shown (VA2c 50d4b0a), so there is no held tail" -- was refuted on the phone
-     * (VA2j): the QTI stateful AV1 decoder emits in DECODE order but keeps a
-     * small output-pipeline tail. For libaom/YouTube deep-B-pyramid content the
-     * frame the client next needs to DISPLAY is a late-decoded frame at the
-     * codec's pipeline head, held until one more access unit arrives.
-     * ffmpeg-vaapi (and Firefox) feed in decode order and sync in display order
-     * on a coupled loop: they block on that head frame and cannot feed ahead, so
-     * the codec -- CAPTURE buffers free, OUTPUT queue empty -- is input-starved
-     * and the frame never comes (VA3-sync-reorder instrumented trace: await=10,
-     * qout=0, free_cap=21, submits=10, produced 1..9). The DEC_CMD_STOP drain
-     * cannot rescue it: mid-stream it DROPS the held frame and resets, emitting
-     * only an empty LAST (measured: CAP-DROP seq=0 bytesused=0 last=1, stash
-     * unchanged) -- so a mid-stream drain loses the frame AND breaks the chain.
-     * Both codec-side levers to remove the delay are refuted (VA2k KEY_LOW_LATENCY,
-     * VA2l .low_latency variant), and a VA-API client cannot feed ahead, so the
-     * wedge is NOT resolvable in guest-side libva. Keep the drain off: fail the
-     * one stalled surface (client falls back to software for deep-B AV1) and keep
-     * the session alive for the frames that follow. VP9 has no output-delay tail
-     * (solid 300/300 incl. 854) and YouTube serves VP9, so VP9 is the browser
-     * path for zero-copy. finish() still drains the genuine tail at EOS. */
+    /* NO mid-stream drain for AV1. The recover_locked DEC_CMD_STOP drain exists
+     * for H.264, whose reorder tail the codec holds back until a drain shakes it
+     * loose; this decoder holds nothing back on a correctly reconstructed AV1
+     * stream. It emits a frame per access unit and keeps up with a client that
+     * syncs every frame before feeding the next, deep-B pyramids included
+     * (measured on the phone: a 166 s browser AV1 session, 5113 bitstream
+     * buffers in / 5113 frames out, zero sync failures). So a mid-stream drain
+     * would extract nothing and cost a seek on a live reference chain: keep it
+     * off, fail the one stalled surface on a hard cap and keep the session alive
+     * for the frames that follow. finish() still drains the genuine tail at EOS.
+     *
+     * Both earlier rationales for this line are WITHDRAWN: VA2e's "AV1 emits
+     * every frame as shown, so there is no held tail", and VA3-sync-reorder's
+     * correction of it, "there IS a decode-order tail and the drain drops it, so
+     * deep-B AV1 cannot decode in a browser". Both were measured while this
+     * backend rebuilt the bitstream incorrectly (heuristic refresh_frame_flags,
+     * a deferred frame carrying another frame's tile_size_bytes, and a missing
+     * lr_uv_shift bit). The decoder was failing on an invalid stream, not
+     * holding frames; with 86ee648 / 95f7c81 / bf6d262 / aec13f4 the same
+     * content decodes zero-copy end to end. The setting itself never changed. */
     options.allow_midstream_drain = false;
     return options;
 }

@@ -917,24 +917,19 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             const bool idle_expired = now >= idle_deadline;
             if (hard_expired || idle_expired) {
                 if (!allow_midstream_drain_) {
-                    /* VP9 and AV1 (VA3-sync-reorder). VP9's display order is
-                     * in-band (show_existing_frame) so the decoder emits
-                     * displayable frames with no held tail -- solid 300/300 incl.
-                     * 854 (VA2j). AV1 deep-B DOES hold a decode-order pipeline
-                     * tail, but a mid-stream DEC_CMD_STOP drain cannot extract it:
-                     * on this device the drain DROPS the held frame and emits only
-                     * an empty LAST (VA3-sync-reorder measurement), so draining
-                     * would lose the frame AND reset the reference chain. Only
-                     * H.264 (allow_midstream_drain default true) takes the
-                     * recover_locked branch below, and only at its EOS tail where
-                     * the drain flushes cleanly. So here keep waiting up to the
-                     * hard cap and, on the cap, fail THIS surface only -- no
-                     * DEC_CMD_STOP, DPB and session intact for the frames that
-                     * follow (deep-B AV1 then falls back to software; VP9 is the
-                     * zero-copy browser path). finish() still drains the genuine
-                     * tail at EOS. */
+                    /* VP9 and AV1. VP9's display order is in-band
+                     * (show_existing_frame), and a correctly reconstructed AV1
+                     * access unit yields its frame straight away, so neither
+                     * codec leaves a mid-stream tail for a DEC_CMD_STOP to
+                     * extract -- issuing one would only seek a live reference
+                     * chain. Only H.264 (allow_midstream_drain default true)
+                     * takes the recover_locked branch below, where the codec
+                     * really does hold its reorder tail until a drain shakes it
+                     * loose. So here keep waiting up to the hard cap and, on the
+                     * cap, fail THIS surface only -- no DEC_CMD_STOP, DPB and
+                     * session intact for the frames that follow. finish() still
+                     * drains the genuine tail at EOS. */
                     if (hard_expired) {
-                        trace_dump_locked("WEDGE-nodrain", sequence);
                         return SyncStatus::decode_error;
                     }
                     wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);

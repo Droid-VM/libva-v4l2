@@ -81,17 +81,17 @@ public:
          * back until a drain shakes it loose -- VA-API has no flush/EOS call, so
          * a mid-stream sync must drain to extract it (B18/B19). VP9 clears it:
          * its display order is in-band (show_existing_frame), so there is no held
-         * tail mid-stream. AV1 ALSO clears it, but for a subtler reason than
-         * VA2e's original note claimed (VA3-sync-reorder corrects it): the QTI
-         * decoder DOES hold a small decode-order output-pipeline tail on deep-B
-         * content, but a mid-stream DEC_CMD_STOP cannot extract it -- on this
-         * device the drain DROPS the held frame and emits only an empty LAST
-         * (measured: CAP-DROP seq=0 bytesused=0 last=1, stash unchanged), so
-         * draining would lose the frame and reset the reference chain. A
-         * single-threaded display-order VA-API client blocks on that held frame
-         * and cannot feed ahead, so deep-B AV1 wedges with no in-stack remedy
-         * (crosvm KEY_LOW_LATENCY VA2k and the .low_latency variant VA2l are both
-         * refuted); it falls back to software while VP9 carries browser zero-copy.
+         * tail mid-stream. AV1 clears it too: on a correctly reconstructed
+         * stream the decoder emits a frame per access unit and keeps up with a
+         * client that syncs every frame before feeding the next (measured: a
+         * 166 s browser session, 5113 access units in / 5113 frames out), so
+         * there is no mid-stream tail for a drain to extract and a DEC_CMD_STOP
+         * would only seek a live reference chain. (An earlier note here claimed
+         * the AV1 decoder held a decode-order tail the drain dropped. That was
+         * measured while this backend was rebuilding the AV1 bitstream
+         * incorrectly -- heuristic refresh_frame_flags and a missing lr_uv_shift
+         * bit -- so the decoder was failing on an invalid stream, not holding
+         * frames back. The claim is withdrawn; the setting is unchanged.)
          * When false, a mid-stream sync waits out the hard cap without a reset and
          * fails only THIS surface as a last resort. finish() (EOS) still drains
          * the true tail in every codec. */

@@ -126,10 +126,10 @@ void test_reorder_absorbed_in_any_sync_order()
      * client syncs in display order). The backend keys the stash by the sequence
      * carried in the OUTPUT timestamp (TIMESTAMP_COPY), so sync(seq) returns THAT
      * sequence's frame whenever it has been produced, regardless of order, and
-     * releasing recycles the CAPTURE buffer with no leak. The wedge investigation
-     * confirmed this mapping is ALREADY correct -- the deep-B AV1 wedge is an
-     * input-starvation stall (session.h allow_midstream_drain doc), NOT a
-     * mis-delivery. Named mutation this fails under: claim_locked() returning
+     * releasing recycles the CAPTURE buffer with no leak. This mapping was
+     * audited during the deep-B AV1 investigation and found already correct: the
+     * stalls seen there came from an invalidly reconstructed bitstream, never
+     * from a mis-delivery. Named mutation this fails under: claim_locked() returning
      * stash_.begin()->second (the front of the stash / FIFO) instead of
      * stash_.find(sequence) -- a scrambled sync then gets the wrong frame. */
     FakeDevice device;
@@ -433,15 +433,14 @@ void test_midstream_drain_is_codec_aware()
 {
     /* The mid-stream idle/timeout DEC_CMD_STOP drain is H.264-only. VP9 emits
      * every frame as shown (in-band show_existing_frame), so it never holds a
-     * mid-stream tail. AV1 deep-B DOES hold a decode-order pipeline tail, but a
-     * mid-stream DEC_CMD_STOP cannot rescue it (VA3-sync-reorder): on the device
-     * the drain DROPS the held frame and resets, so draining would only lose the
-     * frame and break the chain -- AV1 keeps the drain OFF and falls back to
-     * software for deep-B, VP9 carries browser zero-copy. With
+     * mid-stream tail; neither does AV1 on a correctly reconstructed stream (a
+     * frame per access unit, no decode-order tail to shake loose), so for both a
+     * mid-stream DEC_CMD_STOP would extract nothing and only seek a live
+     * reference chain. With
      * Options.allow_midstream_drain = false a stalled sync waits out the hard cap
      * and fails THIS surface WITHOUT a DEC_CMD_STOP; with it true (H.264) the
-     * same stall must still drain (its EOS-shaped tail flushes cleanly). finish()
-     * drains the genuine tail at EOS in both. Named mutations this fails under:
+     * same stall must still drain (its held reorder tail comes out that way).
+     * finish() drains the genuine tail at EOS in both. Named mutations this fails under:
      * default allow_midstream_drain false (H.264 stops draining -- Part B) or
      * dropping the !allow_midstream_drain_ gate in sync() (AV1/VP9 drain and
      * reset again -- Part A). */
