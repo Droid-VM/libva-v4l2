@@ -535,102 +535,6 @@ void test_midstream_drain_is_codec_aware()
     }
 }
 
-void test_fake_au_injection_flushes_pipeline_delay()
-{
-    /* VA3-fakeau SPIKE. The QTI deep-B AV1 decoder holds decoded frame K until
-     * fed AU K+1 (a 1-frame output-pipeline tail); a single-threaded
-     * display-order VA-API client blocks on that held frame and cannot feed
-     * ahead, so the sync wedges (VA3-sync-reorder). With Options.fake_au_injection
-     * on, a stalled input-starved sync injects a copy of the last real AU under a
-     * reserved sentinel sequence to advance the pipeline and flush the held
-     * frame; the padding AU's own output is dropped by its sentinel tag. This
-     * verifies the fake un-wedges the pipeline in the fake device (关卡一) and
-     * that flag-off behaviour is the unchanged wedge. 关卡二 (bit-exactness of
-     * the flushed real pixels) is a device question settled on the phone. */
-
-    /* Part A -- flag OFF: the pipeline-delay stall is an unrecoverable per-surface
-     * decode error, and NOTHING is injected (byte-identical to r401). */
-    {
-        FakeDevice device;
-        device.pipeline_delay = true;
-        StatefulSession::Options options;
-        options.num_surfaces = 6;
-        options.sync_timeout_ms = 40;
-        options.sync_idle_ms = 5;
-        options.allow_midstream_drain = false; /* AV1/VP9 */
-        StatefulSession session(device, 0x3130564d /* AV01 */, 1920, 1088, options);
-
-        session.submit(1, fake_au());
-        session.submit(2, fake_au());
-        session.submit(3, fake_au());
-        StatefulSession::Frame frame;
-        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
-        CHECK(session.sync(2, &frame) == StatefulSession::SyncStatus::ok);
-        /* Frame 3 is held (no AU 4); the client cannot feed ahead -> wedge. */
-        CHECK(session.sync(3, &frame) == StatefulSession::SyncStatus::decode_error);
-        CHECK_EQ(session.fake_au_injected(), 0u); /* off: no injection */
-        CHECK_EQ(session.fake_au_dropped(), 0u);
-        CHECK_EQ(device.decoder_stops, 0u); /* no drain either */
-        CHECK(!session.dead());
-        CHECK(session.provisioned());
-    }
-
-    /* Part B -- flag ON: the same wedge is flushed by one injected padding AU;
-     * sync(3) returns its real frame, the injected output is dropped, and the
-     * pool is leak-free after release. Named mutation this fails under: gate the
-     * injection on allow_midstream_drain_ (never reached) or never drop the
-     * sentinel output (it would be delivered as a bogus frame). */
-    {
-        FakeDevice device;
-        device.pipeline_delay = true;
-        StatefulSession::Options options;
-        options.num_surfaces = 6;
-        options.sync_timeout_ms = 200;
-        options.sync_idle_ms = 5;
-        options.allow_midstream_drain = false;
-        options.fake_au_injection = true; /* the spike, on */
-        StatefulSession session(device, 0x3130564d, 1920, 1088, options);
-
-        session.submit(1, fake_au());
-        session.submit(2, fake_au());
-        session.submit(3, fake_au());
-
-        std::vector<StatefulSession::Frame> claimed;
-        StatefulSession::Frame f1, f2, f3;
-        CHECK(session.sync(1, &f1) == StatefulSession::SyncStatus::ok);
-        CHECK(session.sync(2, &f2) == StatefulSession::SyncStatus::ok);
-        CHECK_EQ(session.fake_au_injected(), 0u); /* 1 and 2 were already out */
-
-        /* The wedge: frame 3 held for AU 4 the client will not send. The
-         * injection flushes it -- sync succeeds where Part A failed. */
-        CHECK(session.sync(3, &f3) == StatefulSession::SyncStatus::ok);
-        CHECK_EQ(session.fake_au_injected(), 1u); /* exactly one padding AU */
-        CHECK_EQ(session.fake_au_dropped(), 0u); /* its output is still held */
-        /* Three real, distinct CAPTURE buffers -- never a sentinel frame. */
-        CHECK(f1.index != f2.index && f2.index != f3.index && f1.index != f3.index);
-        claimed = { f1, f2, f3 };
-
-        /* Feeding a successor pushes the held padding-AU output out; it is
-         * recognised by its sentinel tag and dropped, never stashed. */
-        session.submit(4, fake_au());
-        StatefulSession::Frame f4;
-        CHECK(session.sync(4, &f4) == StatefulSession::SyncStatus::ok);
-        CHECK_EQ(session.fake_au_dropped(), 1u); /* the injected output was dropped */
-        CHECK(f4.index != f1.index && f4.index != f2.index && f4.index != f3.index);
-        claimed.push_back(f4);
-
-        CHECK(!session.dead());
-        CHECK_EQ(device.decoder_stops, 0u); /* flushed WITHOUT a DEC_CMD_STOP */
-
-        /* No surface leak: every claimed real frame recycles its buffer, and the
-         * dropped sentinel buffer was recycled too, so the whole pool is free. */
-        for (const auto& f : claimed) {
-            session.release_frame(f);
-        }
-        CHECK_EQ(device.free_captures.size(), static_cast<size_t>(device.capture_count));
-    }
-}
-
 void test_provision_retry_on_ebusy()
 {
     /* Post-crash (D88): the device refuses REQBUFS/STREAMON with EBUSY while it
@@ -847,7 +751,6 @@ int main()
     test_idle_drain_on_stream_tail();
     test_reenterable_recovery();
     test_midstream_drain_is_codec_aware();
-    test_fake_au_injection_flushes_pipeline_delay();
     test_provision_retry_on_ebusy();
     test_no_drain_before_source_change();
     test_output_ring_growth();

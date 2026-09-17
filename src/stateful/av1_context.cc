@@ -27,7 +27,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <vector>
 
 extern "C" {
@@ -80,18 +79,6 @@ stateful::StatefulSession::Options session_options(
      * (solid 300/300 incl. 854) and YouTube serves VP9, so VP9 is the browser
      * path for zero-copy. finish() still drains the genuine tail at EOS. */
     options.allow_midstream_drain = false;
-    /* VA3-fakeau SPIKE (env LIBVA_V4L2_FAKE_AU, default off; AV1 only). When
-     * set, a mid-stream sync that stalls input-starved on the deep-B reorder
-     * wedge injects a copy of the last real access unit under a sentinel
-     * sequence to advance the codec's output pipeline by one and flush the held
-     * frame, dropping the padding AU's own decoded output. The 关卡二 question
-     * -- whether the duplicate frame, decoded into the DPB against a moved-on
-     * reference state, corrupts the following real frames -- is settled
-     * empirically by a bit-exactness check against software dav1d. Off keeps the
-     * AV1 path byte-identical to r401 (the documented deep-B wedge -> software
-     * fallback). Only ever enabled on the AV1 context, so H.264/VP9 sessions
-     * never construct with it. */
-    options.fake_au_injection = getenv("LIBVA_V4L2_FAKE_AU") != nullptr;
     return options;
 }
 
