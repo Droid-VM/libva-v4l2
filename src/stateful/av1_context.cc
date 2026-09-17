@@ -171,6 +171,17 @@ void StatefulAV1Context::stateful_begin_picture(Surface& surface)
         session_.release_frame(
             { static_cast<unsigned>(surface.stateful_capture_index), surface.stateful_capture_generation });
         surface.stateful_capture_index = -1;
+    } else if (surface.stateful_context == this && surface.status == VASurfaceRendering) {
+        /* The client is reusing a surface it decoded into but never synced -- the
+         * not-shown references of a random-access stream, which it keeps only as
+         * references and drops without ever asking for the pixels. Nobody will
+         * ever claim that sequence, so drop it: the CAPTURE buffer its frame
+         * holds (or will hold when the codec emits it) goes straight back to the
+         * codec instead of sitting in the stash until the pool starves. The
+         * access unit itself is still submitted -- later frames reference that
+         * picture, so the codec must decode it. status is still the old value
+         * here; beginPicture sets Rendering after this returns. */
+        session_.drop_sequence(surface.stateful_sequence);
     }
 }
 
