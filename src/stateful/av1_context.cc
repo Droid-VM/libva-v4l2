@@ -90,8 +90,14 @@ stateful::StatefulSession::Options session_options(
      * empirically by a bit-exactness check against software dav1d. Off keeps the
      * AV1 path byte-identical to r401 (the documented deep-B wedge -> software
      * fallback). Only ever enabled on the AV1 context, so H.264/VP9 sessions
-     * never construct with it. */
-    options.fake_au_injection = getenv("LIBVA_V4L2_FAKE_AU") != nullptr;
+     * never construct with it.
+     *
+     * VA3-fakeau2 SPIKE (env LIBVA_V4L2_FAKE_AU_OHINT, default off; AV1 only).
+     * Same injection machinery, but instead of a byte copy the padding AU is a
+     * SYNTHESISED non-reference frame with a BUMPED order_hint (see the factory
+     * installed in the constructor). Either flag arms the inject path. */
+    options.fake_au_injection
+        = getenv("LIBVA_V4L2_FAKE_AU") != nullptr || getenv("LIBVA_V4L2_FAKE_AU_OHINT") != nullptr;
     return options;
 }
 
@@ -116,6 +122,29 @@ StatefulAV1Context::StatefulAV1Context(DriverData* driver_data, V4L2M2MDevice& d
     , session_(device_io_, V4L2_PIX_FMT_AV1, picture_width, picture_height,
           session_options(driver_data, surface_ids, &allocator_))
 {
+    /* VA3-fakeau2 SPIKE. When LIBVA_V4L2_FAKE_AU_OHINT is present, retain each
+     * real frame's VA inputs and hand the session a factory that builds the
+     * k-th padding AU from the last real inter frame with order_hint bumped by k
+     * and refresh_frame_flags=0 (a genuinely-new, non-reference frame -- the
+     * untested lever from VA3-reorder-probe). The mode value selects the
+     * construction: "2" = hidden padding (show_frame=0, no CAPTURE emitted);
+     * anything else = shown padding (show_frame=1, its CAPTURE dropped by
+     * sentinel tag). The factory is called under the session mutex from a
+     * stalled sync and takes builder_mutex_ here; the order never deadlocks
+     * because stateful_end_picture releases builder_mutex_ before it takes the
+     * session mutex. LIBVA_V4L2_FAKE_AU alone keeps the byte-copy path (no
+     * factory), and neither flag leaves the AV1 path byte-identical to r401. */
+    if (const char* ohint = getenv("LIBVA_V4L2_FAKE_AU_OHINT")) {
+        const bool show_frame = !(ohint[0] == '2');
+        {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            au_builder_.enable_fake_capture();
+        }
+        session_.set_fake_au_factory([this, show_frame](unsigned k) -> std::optional<std::vector<uint8_t>> {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            return au_builder_.synthesize_fake_frame(k, show_frame);
+        });
+    }
 }
 
 StatefulAV1Context::~StatefulAV1Context()

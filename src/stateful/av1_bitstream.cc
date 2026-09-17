@@ -963,7 +963,8 @@ void Av1AccessUnitBuilder::build_sequence_header(const VADecPictureParameterBuff
     s.film_grain_params_present = pic.seq_info_fields.fields.film_grain_params_present;
 }
 
-void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags)
+void Av1AccessUnitBuilder::build_frame_header(
+    const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags, bool show_frame)
 {
     const GstAV1SequenceHeaderOBU& s = seq_;
     GstAV1FrameHeaderOBU& f = frame_;
@@ -987,8 +988,13 @@ void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferA
      * shown makes the decoder emit exactly one output per decode op, in decode
      * order; show_frame does not affect the decoded samples, and the client
      * reorders for display. Low-delay / all-intra streams are already all-shown,
-     * so this is a no-op there. showable_frame is then not coded (5.9.2). */
-    f.show_frame = 1;
+     * so this is a no-op there. showable_frame is then not coded (5.9.2).
+     *
+     * VA3-fakeau2 SPIKE: the hidden-padding construction passes show_frame=false
+     * to emit a decoded-but-not-displayed frame (no CAPTURE output). It is only
+     * ever used for a NON-reference padding frame (refresh_frame_flags=0), so
+     * showable_frame=0 is correct -- nothing shows it later. */
+    f.show_frame = show_frame ? 1 : 0;
     f.showable_frame = 0;
     f.error_resilient_mode = pic.pic_info_fields.bits.error_resilient_mode;
     f.disable_cdf_update = pic.pic_info_fields.bits.disable_cdf_update;
@@ -1392,7 +1398,8 @@ void Av1AccessUnitBuilder::update_dpb(const VADecPictureParameterBufferAV1& pic)
 }
 
 std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParameterBufferAV1& pic,
-    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags)
+    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags,
+    bool show_frame)
 {
     if (pic.seg_info.segment_info_fields.bits.enabled) {
         throw std::runtime_error("AV1 segmentation is not supported by the GStreamer bit writer (VA2b limitation)");
@@ -1406,7 +1413,7 @@ std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParamet
         build_sequence_header(pic);
         have_sequence_ = true;
     }
-    build_frame_header(pic, refresh_frame_flags);
+    build_frame_header(pic, refresh_frame_flags, show_frame);
 
     /* temporal_delimiter OBU. */
     std::vector<uint8_t> au = write_gst_obu(
@@ -1435,6 +1442,55 @@ std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParamet
     return au;
 }
 
+void Av1AccessUnitBuilder::save_last_real(const VADecPictureParameterBufferAV1& pic,
+    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data)
+{
+    /* VA3-fakeau2 SPIKE. Only retained when the AV1 context turned it on; the
+     * shipped path never calls this with capture on, so it is byte-identical. */
+    if (!capture_last_real_) {
+        return;
+    }
+    last_real_pic_ = pic;
+    last_real_tiles_.assign(tiles.begin(), tiles.end());
+    last_real_data_.assign(data.begin(), data.end());
+    have_last_real_ = true;
+}
+
+std::optional<std::vector<uint8_t>> Av1AccessUnitBuilder::synthesize_fake_frame(unsigned k, bool show_frame)
+{
+    /* VA3-fakeau2 SPIKE. Build a padding frame from the last real inter frame's
+     * VA inputs with order_hint bumped by k (>=1) so the QTI AV1 decoder accepts
+     * it as a genuinely NEW frame and advances the reorder to flush the held
+     * real frame (VA3-reorder-probe: a larger order_hint is the emit trigger).
+     * refresh_frame_flags=0 keeps it a NON-reference frame that writes no DPB
+     * slot, so the real reference state the following frames read is unchanged
+     * (the byte-copy VA3-fakeau carried the SAME order_hint -> recognised as a
+     * same-frame replay, consumed but never emitted; this is the untested lever
+     * that carries a NEW order_hint). No update_dpb: the mirrored DPB is left
+     * exactly as the real frames left it. */
+    if (!have_last_real_ || !seq_.enable_order_hint) {
+        return std::nullopt;
+    }
+    const unsigned frame_type = last_real_pic_.pic_info_fields.bits.frame_type;
+    const bool intra = (frame_type == AV1_KEY_FRAME || frame_type == AV1_INTRA_ONLY_FRAME);
+    if (intra) {
+        /* A key/intra base would force refresh_frame_flags=0xFF (a shown key) or
+         * needs no inter references; never use it as a padding template. Mid the
+         * deep-B stall the last real frame is always an inter frame. */
+        return std::nullopt;
+    }
+    VADecPictureParameterBufferAV1 pic = last_real_pic_;
+    const unsigned bits = static_cast<unsigned>(seq_.order_hint_bits_minus_1) + 1u;
+    const uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    pic.order_hint
+        = static_cast<decltype(pic.order_hint)>((static_cast<uint32_t>(last_real_pic_.order_hint) + k) & mask);
+    try {
+        return assemble_au(pic, last_real_tiles_, last_real_data_, /*refresh_frame_flags=*/0, show_frame);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 std::vector<uint8_t> Av1AccessUnitBuilder::finish()
 {
     if (!has_picture_) {
@@ -1454,6 +1510,7 @@ std::vector<uint8_t> Av1AccessUnitBuilder::finish()
         throw;
     }
     update_dpb(picture_);
+    save_last_real(picture_, tile_params_, tile_data_); /* VA3-fakeau2 */
     reset_picture();
     return au;
 }
@@ -1522,6 +1579,7 @@ Av1AccessUnitBuilder::PictureResult Av1AccessUnitBuilder::submit_picture(uint64_
                                              : choose_refresh_flags(pending_->pic); /* no successor: best effort */
         std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
         update_dpb(pending_->pic);
+        save_last_real(pending_->pic, pending_->tiles, pending_->data); /* VA3-fakeau2 */
         result.ready.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
         pending_.reset();
     }
@@ -1558,6 +1616,7 @@ Av1AccessUnitBuilder::PictureResult Av1AccessUnitBuilder::submit_picture(uint64_
     const uint8_t refresh = shown_key ? static_cast<uint8_t>(0xFF) : choose_refresh_flags(picture_);
     std::vector<uint8_t> au = assemble_au(picture_, tile_params_, tile_data_, refresh);
     update_dpb(picture_);
+    save_last_real(picture_, tile_params_, tile_data_); /* VA3-fakeau2 */
     result.ready.push_back({ tag, std::move(au), refresh, picture_.order_hint });
     reset_picture();
     return result;
@@ -1572,6 +1631,7 @@ std::vector<Av1AccessUnitBuilder::ReadyFrame> Av1AccessUnitBuilder::flush()
         const uint8_t refresh = choose_refresh_flags(pending_->pic);
         std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
         update_dpb(pending_->pic);
+        save_last_real(pending_->pic, pending_->tiles, pending_->data); /* VA3-fakeau2 */
         out.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
         pending_.reset();
     }

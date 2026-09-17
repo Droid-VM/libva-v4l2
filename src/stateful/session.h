@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <vector>
@@ -204,6 +205,18 @@ public:
      * unless LIBVA_V4L2_FAKE_AU is set AND a mid-stream AV1 sync stalled. */
     unsigned fake_au_injected() const { return fake_au_injected_; }
     unsigned fake_au_dropped() const { return fake_au_dropped_; }
+    /* VA3-fakeau2 SPIKE: install a factory that builds the k-th padding AU (k>=1
+     * for this stall) instead of a byte copy of the last real AU. The AV1
+     * context sets this to synthesize_fake_frame with a bumped order_hint when
+     * LIBVA_V4L2_FAKE_AU_OHINT is present; left null keeps the byte-copy path
+     * (LIBVA_V4L2_FAKE_AU) unchanged. Returns nullopt to abort the injection.
+     * Called under the session mutex from a stalled sync -- the AV1 factory
+     * takes the builder mutex, an order that never deadlocks (vaEndPicture
+     * releases the builder mutex before it ever takes the session mutex). */
+    void set_fake_au_factory(std::function<std::optional<std::vector<uint8_t>>(unsigned)> factory)
+    {
+        fake_au_factory_ = std::move(factory);
+    }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     int sync_idle_ms() const { return sync_idle_ms_; }
     bool allow_midstream_drain() const { return allow_midstream_drain_; }
@@ -239,10 +252,13 @@ private:
     void retry_provision(const char* what, const std::function<void()>& op);
     void grow_output_buffers_locked(std::unique_lock<std::mutex>& lock, size_t needed);
     int acquire_output_buffer_locked(std::unique_lock<std::mutex>& lock, size_t needed); /* -1 on timeout */
-    /* VA3-fakeau SPIKE: copy the buffered last real AU into a free OUTPUT
-     * buffer and queue it under a fresh sentinel sequence; true if one was
-     * injected. No-op (returns false) when disabled or nothing is buffered. */
-    bool inject_fake_au_locked(std::unique_lock<std::mutex>& lock);
+    /* VA3-fakeau SPIKE: queue one padding AU into a free OUTPUT buffer under a
+     * fresh sentinel sequence; true if one was injected. The bytes are the
+     * factory's k-th synthesised frame (VA3-fakeau2, bumped order_hint) when a
+     * factory is set, else a byte copy of the last real AU (VA3-fakeau). k is
+     * 1-based within this stall. No-op (returns false) when nothing is
+     * available. */
+    bool inject_fake_au_locked(std::unique_lock<std::mutex>& lock, unsigned k);
     void log(const char* message);
 
     StatefulDevice& device_;
@@ -305,6 +321,9 @@ private:
      * output and is dropped, never delivered. */
     static constexpr uint64_t kFakeAuSequenceBase = 1000000000ULL;
     std::vector<uint8_t> last_au_bytes_; /* copy of the last real AU, for injection */
+    /* VA3-fakeau2 SPIKE: when set, builds each padding AU (bumped order_hint)
+     * instead of the byte copy; null keeps the VA3-fakeau byte-copy path. */
+    std::function<std::optional<std::vector<uint8_t>>(unsigned)> fake_au_factory_;
     uint64_t fake_au_next_seq_ = kFakeAuSequenceBase;
     unsigned fake_au_injected_ = 0;
     unsigned fake_au_dropped_ = 0;

@@ -781,40 +781,64 @@ void StatefulSession::grow_output_buffers_locked(std::unique_lock<std::mutex>& l
     device_.stream_output(true);
 }
 
-bool StatefulSession::inject_fake_au_locked(std::unique_lock<std::mutex>& lock)
+bool StatefulSession::inject_fake_au_locked(std::unique_lock<std::mutex>& lock, unsigned k)
 {
     /* VA3-fakeau SPIKE. The caller has established the wedge: input-starved
      * (queued_outputs_ == 0), provisioned, the awaited frame not produced. Feed
-     * the codec one more access unit -- a byte copy of the last real AU -- under
-     * a reserved sentinel sequence, so its pipeline advances by one and the held
-     * real frame is emitted (tagged with its real sequence -> stashed and
-     * delivered), while this injected AU's own output arrives tagged with the
-     * sentinel and is dropped by handle_capture_locked. 关卡二: the duplicate
-     * decodes into the DPB against a DPB that has moved on since the original,
-     * which may corrupt the references the following real frames read -- the
-     * bit-exactness check is the verdict. */
-    if (last_au_bytes_.empty()) {
-        return false;
+     * the codec one more access unit under a reserved sentinel sequence so its
+     * pipeline advances by one and the held real frame is emitted (tagged with
+     * its real sequence -> stashed and delivered), while this injected AU's own
+     * output arrives tagged with the sentinel and is dropped by
+     * handle_capture_locked.
+     *
+     * VA3-fakeau (byte-copy, factory unset): the AU is a byte copy of the last
+     * real AU. It carries the SAME order_hint, so the QTI AV1 codec recognised
+     * it as a same-frame replay -- consumed but never emitted, no flush (the
+     * measured outcome (i)).
+     *
+     * VA3-fakeau2 (bumped order_hint, factory set): the AU is a synthesised
+     * NON-reference frame with order_hint = last real +k, which the codec should
+     * accept as a genuinely NEW frame and so advance the reorder to flush the
+     * held real frame (VA3-reorder-probe: a larger order_hint is the emit
+     * trigger; reorder depth bounded at 4). refresh_frame_flags=0 leaves the
+     * real reference state untouched, so 关卡二 (bit-exactness / perceptual
+     * quality of the following real frames) is the verdict, settled on the
+     * phone. */
+    std::vector<uint8_t> synthesized;
+    std::span<const uint8_t> au_bytes;
+    if (fake_au_factory_) {
+        std::optional<std::vector<uint8_t>> built = fake_au_factory_(k);
+        if (!built || built->empty()) {
+            return false;
+        }
+        synthesized = std::move(*built);
+        au_bytes = synthesized;
+    } else {
+        if (last_au_bytes_.empty()) {
+            return false;
+        }
+        au_bytes = last_au_bytes_;
     }
-    int index = acquire_output_buffer_locked(lock, last_au_bytes_.size());
+    int index = acquire_output_buffer_locked(lock, au_bytes.size());
     if (index < 0) {
         return false;
     }
     auto plane = device_.output_plane(static_cast<unsigned>(index));
-    if (plane.size() < last_au_bytes_.size()) {
+    if (plane.size() < au_bytes.size()) {
         return false;
     }
-    std::copy(last_au_bytes_.begin(), last_au_bytes_.end(), plane.begin());
+    std::copy(au_bytes.begin(), au_bytes.end(), plane.begin());
     const uint64_t seq = fake_au_next_seq_++;
     /* Deliberately NOT counted in submit_count_: a fake AU is not client input
      * flow, so a coupled sync must not read it as "the client is still feeding". */
-    device_.queue_output(static_cast<unsigned>(index), seq, last_au_bytes_.size());
+    device_.queue_output(static_cast<unsigned>(index), seq, au_bytes.size());
     queued_outputs_ += 1;
     fake_au_injected_ += 1;
     if (trace_) {
-        char line[160];
-        snprintf(line, sizeof(line), "TRACE FAKE-AU-INJECT seq=%llu bytes=%zu qout=%u injected=%u",
-            static_cast<unsigned long long>(seq), last_au_bytes_.size(), queued_outputs_, fake_au_injected_);
+        char line[176];
+        snprintf(line, sizeof(line), "TRACE FAKE-AU-INJECT seq=%llu k=%u bytes=%zu synth=%d qout=%u injected=%u",
+            static_cast<unsigned long long>(seq), k, au_bytes.size(), fake_au_factory_ ? 1 : 0, queued_outputs_,
+            fake_au_injected_);
         log(line);
     }
     cv_.notify_all();
@@ -1045,7 +1069,8 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
                      * dropped by its sentinel tag. Disabled by default; only the
                      * AV1 context with LIBVA_V4L2_FAKE_AU reaches here. */
                     if (fake_au_injection_ && provisioned_ && queued_outputs_ == 0
-                        && fakes_this_sync < kMaxFakeInjectionsPerSync && inject_fake_au_locked(lock)) {
+                        && fakes_this_sync < kMaxFakeInjectionsPerSync
+                        && inject_fake_au_locked(lock, fakes_this_sync + 1)) {
                         fakes_this_sync += 1;
                         idle_since = Clock::now(); /* let the codec emit the flushed frame */
                         submits_seen = submit_count_;

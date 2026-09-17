@@ -30,6 +30,7 @@
  */
 
 #include <chrono>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -631,6 +632,98 @@ void test_fake_au_injection_flushes_pipeline_delay()
     }
 }
 
+void test_fake_au_ohint_factory_injection()
+{
+    /* VA3-fakeau2 SPIKE. With a factory installed (the AV1 context does this for
+     * LIBVA_V4L2_FAKE_AU_OHINT), a stalled input-starved sync injects the
+     * FACTORY's synthesised bytes -- not a byte copy of the last real AU -- under
+     * the sentinel sequence, and drops the padding output. This verifies the
+     * session consults the factory (with the 1-based stall index k), injects its
+     * bytes, and that a factory returning nullopt aborts the injection (the
+     * wedge stands). The order_hint mutation itself is covered by the AV1
+     * bitstream test; here the payload is an opaque marker. */
+
+    /* Part A -- factory drives the flush; its bytes are what gets queued. */
+    {
+        FakeDevice device;
+        device.pipeline_delay = true;
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 200;
+        options.sync_idle_ms = 5;
+        options.allow_midstream_drain = false;
+        options.fake_au_injection = true;
+        StatefulSession session(device, 0x3130564d, 1920, 1088, options);
+
+        unsigned factory_calls = 0;
+        unsigned last_k = 0;
+        session.set_fake_au_factory([&](unsigned k) -> std::optional<std::vector<uint8_t>> {
+            factory_calls += 1;
+            last_k = k;
+            /* A distinct, non-empty padding payload (an order_hint-bumped frame
+             * on the phone; an opaque marker here). */
+            return std::vector<uint8_t>(96, static_cast<uint8_t>(0xA0 + k));
+        });
+
+        session.submit(1, fake_au());
+        session.submit(2, fake_au());
+        session.submit(3, fake_au());
+
+        StatefulSession::Frame f1, f2, f3;
+        CHECK(session.sync(1, &f1) == StatefulSession::SyncStatus::ok);
+        CHECK(session.sync(2, &f2) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(session.fake_au_injected(), 0u);
+
+        /* The wedge on frame 3 is flushed by one injected padding AU built by the
+         * factory, called with k = 1. */
+        CHECK(session.sync(3, &f3) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(session.fake_au_injected(), 1u);
+        CHECK_EQ(factory_calls, 1u);
+        CHECK_EQ(last_k, 1u);
+        CHECK(f1.index != f2.index && f2.index != f3.index && f1.index != f3.index);
+
+        /* The padding output is dropped by its sentinel tag when a successor
+         * pushes it out. */
+        session.submit(4, fake_au());
+        StatefulSession::Frame f4;
+        CHECK(session.sync(4, &f4) == StatefulSession::SyncStatus::ok);
+        CHECK_EQ(session.fake_au_dropped(), 1u);
+        CHECK(!session.dead());
+        CHECK_EQ(device.decoder_stops, 0u);
+    }
+
+    /* Part B -- a factory that declines (nullopt) injects nothing: the wedge
+     * stands exactly as with the spike off. */
+    {
+        FakeDevice device;
+        device.pipeline_delay = true;
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.sync_timeout_ms = 40;
+        options.sync_idle_ms = 5;
+        options.allow_midstream_drain = false;
+        options.fake_au_injection = true;
+        StatefulSession session(device, 0x3130564d, 1920, 1088, options);
+
+        unsigned factory_calls = 0;
+        session.set_fake_au_factory([&](unsigned) -> std::optional<std::vector<uint8_t>> {
+            factory_calls += 1;
+            return std::nullopt; /* cannot synthesise -> abort injection */
+        });
+
+        session.submit(1, fake_au());
+        session.submit(2, fake_au());
+        session.submit(3, fake_au());
+        StatefulSession::Frame frame;
+        CHECK(session.sync(1, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK(session.sync(2, &frame) == StatefulSession::SyncStatus::ok);
+        CHECK(session.sync(3, &frame) == StatefulSession::SyncStatus::decode_error);
+        CHECK(factory_calls >= 1u); /* it was consulted */
+        CHECK_EQ(session.fake_au_injected(), 0u); /* but nothing was queued */
+        CHECK(!session.dead());
+    }
+}
+
 void test_provision_retry_on_ebusy()
 {
     /* Post-crash (D88): the device refuses REQBUFS/STREAMON with EBUSY while it
@@ -848,6 +941,7 @@ int main()
     test_reenterable_recovery();
     test_midstream_drain_is_codec_aware();
     test_fake_au_injection_flushes_pipeline_delay();
+    test_fake_au_ohint_factory_injection();
     test_provision_retry_on_ebusy();
     test_no_drain_before_source_change();
     test_output_ring_growth();
