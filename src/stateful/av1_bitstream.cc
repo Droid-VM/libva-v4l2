@@ -963,8 +963,8 @@ void Av1AccessUnitBuilder::build_sequence_header(const VADecPictureParameterBuff
     s.film_grain_params_present = pic.seq_info_fields.fields.film_grain_params_present;
 }
 
-void Av1AccessUnitBuilder::build_frame_header(
-    const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags, bool shown)
+void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferAV1& pic,
+    std::span<const VASliceParameterBufferAV1> tiles, uint8_t refresh_frame_flags, bool shown)
 {
     const GstAV1SequenceHeaderOBU& s = seq_;
     GstAV1FrameHeaderOBU& f = frame_;
@@ -1141,9 +1141,16 @@ void Av1AccessUnitBuilder::build_frame_header(
     ti.context_update_tile_id = pic.context_update_tile_id;
     {
         /* tile_size_bytes for the multi-tile group: enough to hold the largest
-         * tile's size minus one. */
+         * tile's size minus one. It MUST come from the tiles of THIS frame -- the
+         * frame being assembled is often not the one whose buffers are currently
+         * accumulated (a frame held for the lookahead, a provisional frame, a
+         * catch-up frame), and build_tile_group_payload writes each tile's size
+         * field in exactly the width this header signals. Reading the live
+         * accumulator here wrote one frame's header against another frame's tile
+         * sizes, which is invisible with a single tile (no size field is coded)
+         * and corrupts every multi-tile frame. */
         uint32_t max_tile = 0;
-        for (const auto& t : tile_params_) {
+        for (const auto& t : tiles) {
             max_tile = std::max(max_tile, t.slice_data_size);
         }
         unsigned bytes = 1;
@@ -1412,7 +1419,7 @@ std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParamet
         build_sequence_header(pic);
         have_sequence_ = true;
     }
-    build_frame_header(pic, refresh_frame_flags, shown);
+    build_frame_header(pic, tiles, refresh_frame_flags, shown);
 
     std::vector<uint8_t> au;
     if (!bare) {

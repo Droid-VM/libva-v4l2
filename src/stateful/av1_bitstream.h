@@ -221,7 +221,11 @@ private:
 
     void reset_picture();
     void build_sequence_header(const VADecPictureParameterBufferAV1& pic);
-    void build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags, bool shown);
+    /* `tiles` are THIS frame's tile parameters (not the live accumulator): the
+     * header's tile_size_bytes is derived from them and the tile group writes its
+     * size fields in that width. */
+    void build_frame_header(const VADecPictureParameterBufferAV1& pic, std::span<const VASliceParameterBufferAV1> tiles,
+        uint8_t refresh_frame_flags, bool shown);
     /* Assemble TD [+ seq] [+ a queued catch-up frame] + frame header + tile group
      * for one frame with an explicit refresh_frame_flags; leaves frame_ populated
      * for update_dpb. `shown` writes show_frame (a catch-up frame is hidden, so

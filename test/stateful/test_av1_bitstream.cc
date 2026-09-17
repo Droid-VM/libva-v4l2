@@ -723,6 +723,114 @@ void test_provisional_flush_and_catch_up()
     gst_av1_parser_free(parser);
 }
 
+/*
+ * (F3) A frame held for the lookahead is assembled while the builder's live
+ * buffers already hold the NEXT frame. Its header's tile_size_bytes must come
+ * from ITS OWN tiles, because build_tile_group_payload writes each tile's size
+ * field in exactly that width.
+ *
+ * The NAMED MUTATION is "derive tile_size_bytes from the live tile accumulator"
+ * (what the code did): the deferred frame has a 300-byte tile and needs 2 bytes
+ * per size field, the frame that displaced it needs 1, and a 1-byte field cannot
+ * hold 299 -- the tile group is then unparseable. Invisible with a single tile
+ * (no size field is coded at all), which is why only a multi-tile stream -- what
+ * YouTube serves -- ever showed it.
+ */
+void test_deferred_frame_keeps_its_own_tile_size_bytes()
+{
+    GstAV1Parser* parser = gst_av1_parser_new();
+    Av1AccessUnitBuilder builder;
+
+    VASurfaceID model[8];
+    const VASurfaceID key_surface = 100;
+
+    auto two_tiles = [](Av1AccessUnitBuilder& b, VADecPictureParameterBufferAV1& pic, size_t big, size_t small_,
+                         std::vector<uint8_t>& data_out) {
+        pic.tile_cols = 2;
+        pic.tile_rows = 1;
+        VASliceParameterBufferAV1 sp[2];
+        memset(sp, 0, sizeof(sp));
+        auto t0 = fake_tile(big, 3);
+        auto t1 = fake_tile(small_, 9);
+        data_out.clear();
+        data_out.insert(data_out.end(), t0.begin(), t0.end());
+        data_out.insert(data_out.end(), t1.begin(), t1.end());
+        sp[0].slice_data_offset = 0;
+        sp[0].slice_data_size = static_cast<uint32_t>(t0.size());
+        sp[0].tile_column = 0;
+        sp[1].slice_data_offset = static_cast<uint32_t>(t0.size());
+        sp[1].slice_data_size = static_cast<uint32_t>(t1.size());
+        sp[1].tile_column = 1;
+        b.set_picture_parameters(pic);
+        b.add_tile_parameters({ sp, 2 });
+        b.add_tile_data(data_out);
+    };
+
+    /* Key frame, 2 tiles, emitted immediately. */
+    std::vector<uint8_t> key_data;
+    {
+        auto pic = make_pic(640, 480, 0 /* KEY */, 100);
+        pic.current_frame = key_surface;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = VA_INVALID_SURFACE;
+        }
+        two_tiles(builder, pic, 64, 48, key_data);
+        auto r = builder.submit_picture(1);
+        CHECK(r.ready.size() == 1);
+        (void)parse_au(parser, r.ready[0].access_unit);
+        for (int i = 0; i < 8; i++) {
+            model[i] = key_surface;
+        }
+    }
+
+    /* Frame A: a BIG tile (300 bytes -> tile_size_bytes 2). Deferred. */
+    std::vector<uint8_t> a_data;
+    {
+        auto pic = make_pic(640, 480, 1 /* INTER */, 100);
+        pic.current_frame = 101;
+        pic.order_hint = 1;
+        pic.primary_ref_frame = 0;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = model[i];
+        }
+        for (int i = 0; i < 7; i++) {
+            pic.ref_frame_idx[i] = 7;
+        }
+        two_tiles(builder, pic, 300, 200, a_data);
+        auto r = builder.submit_picture(2);
+        CHECK(r.current_deferred);
+        CHECK(r.ready.empty());
+    }
+
+    /* Frame B: SMALL tiles (40 bytes -> tile_size_bytes 1). Its arrival emits A,
+     * while the live accumulator already holds B's tiles. */
+    std::vector<uint8_t> b_data;
+    {
+        auto pic = make_pic(640, 480, 1 /* INTER */, 100);
+        pic.current_frame = 102;
+        pic.order_hint = 2;
+        pic.primary_ref_frame = 0;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = (i == 0) ? 101 : model[i];
+        }
+        for (int i = 0; i < 7; i++) {
+            pic.ref_frame_idx[i] = 7;
+        }
+        two_tiles(builder, pic, 40, 30, b_data);
+        auto r = builder.submit_picture(3);
+        CHECK(r.ready.size() == 1); /* frame A */
+        auto parsed = parse_au(parser, r.ready[0].access_unit);
+        CHECK(parsed.ok);
+        CHECK(parsed.have_tile_group);
+        /* A's own tiles need two size bytes; the mutation would write one. */
+        CHECK_EQ(parsed.frame.tile_info.tile_size_bytes, 2u);
+        /* And the payload survives byte-for-byte. */
+        CHECK(parsed.tile_bytes == a_data);
+    }
+
+    gst_av1_parser_free(parser);
+}
+
 void test_segmentation_rejected()
 {
     Av1AccessUnitBuilder builder;
@@ -758,6 +866,7 @@ int main()
     test_random_access_refresh_lookahead();
     test_refresh_derivation_exact();
     test_provisional_flush_and_catch_up();
+    test_deferred_frame_keeps_its_own_tile_size_bytes();
     test_segmentation_rejected();
 
     if (g_check_failures != 0) {
