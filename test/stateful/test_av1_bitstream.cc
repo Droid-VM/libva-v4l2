@@ -372,6 +372,64 @@ void test_loop_restoration_unit_shift_fix()
 }
 
 /*
+ * VA3-lastmile: lr_params (5.9.20) sets usesChromaLr from ANY chroma plane, so a
+ * frame that restores U but leaves V alone still carries lr_uv_shift. Dropping
+ * that one bit makes the whole uncompressed header one bit short from tx_mode
+ * onwards -- the decoder then reads garbage and runs off the end of the OBU.
+ * Real stock-YouTube AV1 produces exactly this plane combination, which is why
+ * Firefox decoded 131 frames and then fed one unparseable access unit. Sweep
+ * every (Y, U, V) restoration triple against every unit shift and assert the
+ * header parses back and the chroma shift survives.
+ */
+void test_chroma_loop_restoration_uv_shift_bit()
+{
+    for (unsigned y = 0; y < 4; y++) {
+        for (unsigned u = 0; u < 4; u++) {
+            for (unsigned v = 0; v < 4; v++) {
+                for (unsigned shift = 0; shift <= 2; shift++) {
+                    for (unsigned uv_shift = 0; uv_shift <= 1; uv_shift++) {
+                        GstAV1Parser* parser = gst_av1_parser_new();
+                        Av1AccessUnitBuilder builder;
+
+                        auto tile = fake_tile(64, static_cast<uint8_t>(y * 16 + u * 4 + v));
+                        auto pic = make_pic(256, 256, 0 /* KEY */, 100);
+                        pic.loop_restoration_fields.bits.yframe_restoration_type = y;
+                        pic.loop_restoration_fields.bits.cbframe_restoration_type = u;
+                        pic.loop_restoration_fields.bits.crframe_restoration_type = v;
+                        pic.loop_restoration_fields.bits.lr_unit_shift = shift;
+                        pic.loop_restoration_fields.bits.lr_uv_shift = uv_shift;
+                        VASliceParameterBufferAV1 sp;
+                        memset(&sp, 0, sizeof(sp));
+                        sp.slice_data_size = static_cast<uint32_t>(tile.size());
+                        builder.set_picture_parameters(pic);
+                        builder.add_tile_parameters({ &sp, 1 });
+                        builder.add_tile_data(tile);
+                        auto parsed = parse_au(parser, builder.finish());
+
+                        CHECK(parsed.ok);
+                        CHECK(parsed.have_frame);
+                        const GstAV1LoopRestorationParams& lr = parsed.frame.loop_restoration_params;
+                        CHECK_EQ(static_cast<unsigned>(lr.frame_restoration_type[0]), y);
+                        CHECK_EQ(static_cast<unsigned>(lr.frame_restoration_type[1]), u);
+                        CHECK_EQ(static_cast<unsigned>(lr.frame_restoration_type[2]), v);
+                        const bool uses_lr = (y != 0 || u != 0 || v != 0);
+                        const bool uses_chroma_lr = (u != 0 || v != 0);
+                        if (uses_lr) {
+                            CHECK_EQ(static_cast<unsigned>(lr.lr_unit_shift), shift);
+                        }
+                        CHECK_EQ(static_cast<unsigned>(lr.lr_uv_shift), (uses_lr && uses_chroma_lr) ? uv_shift : 0u);
+                        /* The tile payload lands where the header says it does
+                         * only if the header consumed exactly the right bits. */
+                        CHECK(parsed.tile_bytes == tile);
+                        gst_av1_parser_free(parser);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*
  * VA2c: the one-frame-lookahead reconstruction of refresh_frame_flags. A
  * random-access (deep B-pyramid) sequence fills the 8-slot DPB with distinct
  * live surfaces; VA does not carry refresh_frame_flags, and the immediate
@@ -863,6 +921,7 @@ int main()
     test_keyframe_roundtrip();
     test_inter_roundtrip();
     test_loop_restoration_unit_shift_fix();
+    test_chroma_loop_restoration_uv_shift_bit();
     test_random_access_refresh_lookahead();
     test_refresh_derivation_exact();
     test_provisional_flush_and_catch_up();

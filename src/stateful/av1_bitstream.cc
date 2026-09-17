@@ -549,7 +549,11 @@ namespace {
                     break;
                 }
             }
-            if (lr.frame_restoration_type[i] != GST_AV1_FRAME_RESTORE_NONE && i > 1) {
+            /* 5.9.20: usesChromaLr is set by ANY chroma plane (i > 0), not just
+             * the V plane. A frame that restores U but not V (a real YouTube AV1
+             * combination) otherwise loses its lr_uv_shift bit and the whole
+             * frame header goes one bit short -- unparseable from tx_mode on. */
+            if (lr.frame_restoration_type[i] != GST_AV1_FRAME_RESTORE_NONE && i > 0) {
                 use_chroma_lr = 1;
             }
             bw.put(j, 2);
