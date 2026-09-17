@@ -169,28 +169,6 @@ public:
     bool has_pending() const { return pending_.has_value(); }
     uint64_t pending_tag() const { return pending_ ? pending_->tag : 0; }
 
-    /* VA3-fakeau2 SPIKE. Turn on retention of the last real frame's VA inputs
-     * (pic + tiles + data) so synthesize_fake_frame() can rebuild a padding
-     * frame from them. Off by default so the normal path allocates nothing
-     * extra and is byte-identical to r402's OFF path (only the AV1 context with
-     * LIBVA_V4L2_FAKE_AU_OHINT enables it). */
-    void enable_fake_capture() { capture_last_real_ = true; }
-
-    /* VA3-fakeau2 SPIKE. Synthesise a NON-reference padding frame from the last
-     * real inter frame's VA inputs, with a BUMPED order_hint (last real +k) so
-     * the QTI AV1 decoder treats it as a genuinely NEW frame -- advancing the
-     * reorder and flushing the held real frame -- and refresh_frame_flags=0 so
-     * it never overwrites a real DPB reference slot (VA3-reorder-probe: the
-     * decoder emits a held display frame only when fed a later order_hint;
-     * reorder depth is bounded at 4). show_frame selects a shown padding frame
-     * (the codec emits a CAPTURE the session drops by sentinel tag) or a hidden
-     * one (no CAPTURE emitted). Returns std::nullopt when nothing usable was
-     * retained (no real inter frame yet, order_hint disabled, or assembly
-     * failed). Does NOT mutate the mirrored DPB (refresh=0, no update_dpb), so
-     * the following real frames read the unchanged reference state -- the
-     * bit-exactness question 关卡二 is settled on the phone. */
-    std::optional<std::vector<uint8_t>> synthesize_fake_frame(unsigned k, bool show_frame);
-
     /* Test hooks: the last synthesised gst structures (for host tests). */
     const GstAV1SequenceHeaderOBU& last_sequence_header() const { return seq_; }
     const GstAV1FrameHeaderOBU& last_frame_header() const { return frame_; }
@@ -207,21 +185,12 @@ private:
 
     void reset_picture();
     void build_sequence_header(const VADecPictureParameterBufferAV1& pic);
-    /* show_frame overridable for the VA3-fakeau2 hidden-padding construction;
-     * the real path always emits shown (VA2c), so it defaults to true. */
-    void build_frame_header(
-        const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags, bool show_frame = true);
+    void build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags);
     /* Assemble TD [+ seq] + frame header + tile group for one frame with an
      * explicit refresh_frame_flags; leaves frame_ populated for update_dpb.
      * Throws on segmentation. */
     std::vector<uint8_t> assemble_au(const VADecPictureParameterBufferAV1& pic,
-        std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags,
-        bool show_frame = true);
-    /* VA3-fakeau2 SPIKE: retain a copy of a real frame's VA inputs when
-     * capture_last_real_ is on, so a later padding frame can be built from
-     * them. No-op otherwise. */
-    void save_last_real(const VADecPictureParameterBufferAV1& pic, std::span<const VASliceParameterBufferAV1> tiles,
-        std::span<const uint8_t> data);
+        std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags);
     void compute_skip_mode_frame(const VADecPictureParameterBufferAV1& pic);
     uint8_t choose_refresh_flags(const VADecPictureParameterBufferAV1& pic) const;
     /* True when refresh_frame_flags is ambiguous without a lookahead: the DPB is
@@ -248,16 +217,6 @@ private:
 
     Av1Dpb dpb_;
     std::optional<PendingFrame> pending_;
-
-    /* VA3-fakeau2 SPIKE: the last real frame's VA inputs, retained only when
-     * capture_last_real_ is set, so synthesize_fake_frame() can rebuild a
-     * padding frame from a genuine frame (same tiles/refs) with a bumped
-     * order_hint. Off by default -> zero extra work on the shipped path. */
-    bool capture_last_real_ = false;
-    bool have_last_real_ = false;
-    VADecPictureParameterBufferAV1 last_real_pic_ {};
-    std::vector<VASliceParameterBufferAV1> last_real_tiles_;
-    std::vector<uint8_t> last_real_data_;
 };
 
 /* 5.11.1 tile_group_obu payload (without the OBU header/size): with one tile it
