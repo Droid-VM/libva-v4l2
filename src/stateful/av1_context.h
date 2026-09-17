@@ -75,6 +75,11 @@ public:
     VAStatus store_buffer(const Buffer& buffer) const override;
     int set_controls() override { return VA_STATUS_SUCCESS; }
     bool is_stateful() const override { return true; }
+    /* ffmpeg (and Firefox) decode the not-shown references of a random-access
+     * AV1 stream into a surface, never sync them, and reuse the surface: the
+     * decode is abandoned, not busy (see Context::allows_abandoned_surface_reuse
+     * and stateful_begin_picture). */
+    bool allows_abandoned_surface_reuse() const override { return true; }
     void stateful_begin_picture(Surface& surface) override;
     VAStatus stateful_end_picture(VADriverContextP va_context, Surface& surface) override;
 

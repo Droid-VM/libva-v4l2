@@ -71,7 +71,11 @@ VAStatus beginPicture(VADriverContextP va_context, VAContextID context_id, VASur
         }
         surface = &surface_it->second;
 
-        if (surface->status == VASurfaceRendering) {
+        /* A surface the client decoded into and released without syncing is not
+         * busy -- the codec never decoded into it (see
+         * allows_abandoned_surface_reuse); the context below drops the abandoned
+         * sequence and the client reuses the surface. */
+        if (surface->status == VASurfaceRendering && !context->allows_abandoned_surface_reuse()) {
             return VA_STATUS_ERROR_SURFACE_BUSY;
         }
     }

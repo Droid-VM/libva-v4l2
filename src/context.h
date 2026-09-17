@@ -58,6 +58,19 @@ public:
      * whole queue lifecycle, so vaBeginPicture/vaEndPicture divert to these
      * hooks instead of the stateless per-request flow. */
     virtual bool is_stateful() const { return false; }
+    /* A VA client may decode into a surface and then release it WITHOUT ever
+     * syncing it -- ffmpeg does exactly that for the AV1 references a
+     * random-access stream never displays -- and the surface then comes back
+     * round its pool as the target of a new vaBeginPicture while this backend
+     * still has it VASurfaceRendering. Refusing that with SURFACE_BUSY stops the
+     * client feeding (measured: the 854x480 deep-B clip stalls after 59 frames
+     * with 139 x "surface is in use" + 139 x "invalid VASurfaceID"), and it
+     * protects nothing: a stateful codec decodes into its OWN CAPTURE pool, not
+     * into the client's surface, so "Rendering" here only means "a decode this
+     * client abandoned". A context that says true instead drops that abandoned
+     * sequence in stateful_begin_picture. Default false keeps the VA surface-busy
+     * contract for every other context. */
+    virtual bool allows_abandoned_surface_reuse() const { return false; }
     virtual void stateful_begin_picture(Surface& surface) { (void)surface; }
     virtual VAStatus stateful_end_picture(VADriverContextP va_context, Surface& surface)
     {
