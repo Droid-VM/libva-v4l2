@@ -186,10 +186,10 @@ VAStatus StatefulAV1Context::stateful_end_picture(VADriverContextP va_context, S
         }
         sequence = next_sequence_++;
         try {
-            /* VA2c: resolve the one-frame lookahead. This may emit a previously
-             * deferred frame (using this frame's ref_frame_map to recover its
-             * refresh_frame_flags) and/or this frame; a random-access frame
-             * whose refresh is still ambiguous is held for the next call. */
+            /* Resolve the one-frame lookahead. This frame's ref_frame_map
+             * DERIVES the previously held frame's refresh_frame_flags exactly,
+             * emitting it; this frame is then held in turn (a key frame is
+             * exact on its own and goes out immediately). */
             result = au_builder_.submit_picture(sequence);
         } catch (const std::exception& e) {
             error_log(va_context, "Failed to assemble AV1 access unit: %s\n", e.what());
@@ -235,10 +235,11 @@ VAStatus StatefulAV1Context::sync_surface(VADriverContextP va_context, Surface& 
         return VA_STATUS_SUCCESS;
     }
 
-    /* VA2c: the client is waiting on a frame still held for the one-frame
-     * lookahead -- the end-of-stream tail, or a low-delay client that syncs each
-     * frame before decoding the next. No successor is coming in time, so emit it
-     * now with a best-effort refresh_frame_flags and submit it before we wait. */
+    /* The client is waiting on a frame still held for the one-frame lookahead --
+     * the end-of-stream tail, or a low-delay client that syncs each frame before
+     * decoding the next. No successor is coming in time, so its
+     * refresh_frame_flags cannot be derived: emit it with the best-effort
+     * (self-consistent) mask and submit it before we wait. */
     std::vector<stateful::Av1AccessUnitBuilder::ReadyFrame> tail;
     {
         std::lock_guard<std::mutex> guard(builder_mutex_);

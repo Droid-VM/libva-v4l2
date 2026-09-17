@@ -963,7 +963,8 @@ void Av1AccessUnitBuilder::build_sequence_header(const VADecPictureParameterBuff
     s.film_grain_params_present = pic.seq_info_fields.fields.film_grain_params_present;
 }
 
-void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags)
+void Av1AccessUnitBuilder::build_frame_header(
+    const VADecPictureParameterBufferAV1& pic, uint8_t refresh_frame_flags, bool shown)
 {
     const GstAV1SequenceHeaderOBU& s = seq_;
     GstAV1FrameHeaderOBU& f = frame_;
@@ -988,7 +989,10 @@ void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferA
      * order; show_frame does not affect the decoded samples, and the client
      * reorders for display. Low-delay / all-intra streams are already all-shown,
      * so this is a no-op there. showable_frame is then not coded (5.9.2). */
-    f.show_frame = 1;
+    f.show_frame = shown ? 1 : 0;
+    /* A hidden DPB catch-up frame is the ONE frame we emit unshown: it re-decodes
+     * a frame the client already has, purely to land it in the slots the encoder
+     * refreshed (see the header). Nothing ever show_existing's it. */
     f.showable_frame = 0;
     f.error_resilient_mode = pic.pic_info_fields.bits.error_resilient_mode;
     f.disable_cdf_update = pic.pic_info_fields.bits.disable_cdf_update;
@@ -1309,8 +1313,15 @@ void Av1AccessUnitBuilder::compute_skip_mode_frame(const VADecPictureParameterBu
 uint8_t Av1AccessUnitBuilder::choose_refresh_flags(const VADecPictureParameterBufferAV1& pic) const
 {
     /*
-     * VA does not carry refresh_frame_flags, so we choose a slot to hold this
-     * frame ourselves and remap ref_frame_idx into our mirrored DPB. The
+     * BEST EFFORT ONLY -- used when there is NO successor frame to derive the
+     * exact mask from (flush(): the end-of-stream tail, or a client that syncs a
+     * frame before decoding the next; and the immediate finish() test API).
+     * While a successor exists the builder derives the mask exactly instead
+     * (derive_refresh_frame_flags), which is what keeps the mirrored DPB equal to
+     * the encoder's.
+     *
+     * Here VA does not (yet) tell us which slot this frame took, so we choose one
+     * ourselves and remap ref_frame_idx into our mirrored DPB. The
      * invariant that keeps every future reference resolvable is: our DPB must
      * contain every surface still live in VA's reference map. We therefore
      * refresh ONE slot (matching the encoder's usual single-slot pattern),
@@ -1345,16 +1356,10 @@ uint8_t Av1AccessUnitBuilder::choose_refresh_flags(const VADecPictureParameterBu
         return mask;
     }
     /*
-     * The 8-slot DPB is full of distinct VA-live surfaces. VA does not tell us
-     * which one the encoder is about to drop (refresh_frame_flags is not in the
-     * VA buffer), so we evict the oldest by order hint. This is the ONE case
-     * that is not reconstructable exactly -- a hierarchical B-pyramid (VOD /
-     * YouTube) can wedge here and the affected frame then fails to decode
-     * (the client falls back to software for it). Low-delay / P-frame streaming
-     * never fills the DPB this way and reconstructs bit-exactly. The exact fix
-     * needs a one-frame lookahead to recover refresh_frame_flags from the next
-     * frame's ref_frame_map (a follow-up; it conflicts with the immediate
-     * submit the low-delay path relies on).
+     * The 8-slot DPB is full of distinct VA-live surfaces and no successor is
+     * available, so evict the oldest by order hint. Reaching this line at all
+     * means a random-access frame was flushed without its successor (sync before
+     * the next decode); the derived path never does.
      */
     int oldest = 0;
     for (int j = 1; j < GST_AV1_NUM_REF_FRAMES; j++) {
@@ -1392,7 +1397,8 @@ void Av1AccessUnitBuilder::update_dpb(const VADecPictureParameterBufferAV1& pic)
 }
 
 std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParameterBufferAV1& pic,
-    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags)
+    std::span<const VASliceParameterBufferAV1> tiles, std::span<const uint8_t> data, uint8_t refresh_frame_flags,
+    bool shown, bool bare)
 {
     if (pic.seg_info.segment_info_fields.bits.enabled) {
         throw std::runtime_error("AV1 segmentation is not supported by the GStreamer bit writer (VA2b limitation)");
@@ -1406,18 +1412,30 @@ std::vector<uint8_t> Av1AccessUnitBuilder::assemble_au(const VADecPictureParamet
         build_sequence_header(pic);
         have_sequence_ = true;
     }
-    build_frame_header(pic, refresh_frame_flags);
+    build_frame_header(pic, refresh_frame_flags, shown);
 
-    /* temporal_delimiter OBU. */
-    std::vector<uint8_t> au = write_gst_obu(
-        [](guint8* d, guint* size) { return gst_av1_bit_writer_temporal_delimiter_obu(TRUE, d, size); });
+    std::vector<uint8_t> au;
+    if (!bare) {
+        /* temporal_delimiter OBU. */
+        au = write_gst_obu(
+            [](guint8* d, guint* size) { return gst_av1_bit_writer_temporal_delimiter_obu(TRUE, d, size); });
 
-    /* sequence_header OBU: emit on change (deduped like the H.264 SPS). */
-    std::vector<uint8_t> seq_obu = write_gst_obu(
-        [&](guint8* d, guint* size) { return gst_av1_bit_writer_sequence_header_obu(&seq_, TRUE, d, size); });
-    if (seq_obu != last_emitted_sequence_header_) {
-        au.insert(au.end(), seq_obu.begin(), seq_obu.end());
-        last_emitted_sequence_header_ = seq_obu;
+        /* sequence_header OBU: emit on change (deduped like the H.264 SPS). */
+        std::vector<uint8_t> seq_obu = write_gst_obu(
+            [&](guint8* d, guint* size) { return gst_av1_bit_writer_sequence_header_obu(&seq_, TRUE, d, size); });
+        if (seq_obu != last_emitted_sequence_header_) {
+            au.insert(au.end(), seq_obu.begin(), seq_obu.end());
+            last_emitted_sequence_header_ = seq_obu;
+        }
+
+        /* A hidden DPB catch-up frame waiting for a temporal unit rides in this
+         * one, ahead of the frame that may reference it. A temporal unit may
+         * carry several coded frames as long as exactly one of them is shown
+         * (5.6); the catch-up frame is the unshown one. */
+        if (!catch_up_.empty()) {
+            au.insert(au.end(), catch_up_.begin(), catch_up_.end());
+            catch_up_.clear();
+        }
     }
 
     /* frame_header OBU: serialised here (not by the gst writer) to fix the gst
@@ -1458,51 +1476,26 @@ std::vector<uint8_t> Av1AccessUnitBuilder::finish()
     return au;
 }
 
-bool Av1AccessUnitBuilder::refresh_is_ambiguous(const VADecPictureParameterBufferAV1& pic) const
+uint8_t derive_refresh_frame_flags(VASurfaceID current_frame, const VASurfaceID next_ref_frame_map[8])
 {
-    auto in_map = [&](VASurfaceID id) {
-        for (int j = 0; j < GST_AV1_NUM_REF_FRAMES; j++) {
-            if (pic.ref_frame_map[j] == id) {
-                return true;
-            }
-        }
-        return false;
-    };
-    /* A dead / empty slot means the immediate heuristic refreshes only dead
-     * slots -- it never evicts a live surface and never diverges destructively
-     * from the encoder's DPB, so refresh_frame_flags is unambiguous. This is the
-     * low-delay / P-frame case (the DPB always keeps a dead slot) and the frames
-     * before the DPB first fills. */
-    for (int j = 0; j < GST_AV1_NUM_REF_FRAMES; j++) {
-        if (!dpb_.slots[j].valid || !in_map(dpb_.slots[j].surface)) {
-            return false;
-        }
-    }
-    /* The DPB is full of live surfaces: storing this frame forces the eviction
-     * of a live slot, and VA does not say which. Any immediate guess diverges
-     * from the encoder's DPB, and once a few frames have guessed, our slot
-     * assignments drift until a still-live reference (e.g. the GOP key frame)
-     * is overwritten and a later frame cannot resolve it (the random-access /
-     * deep-B-pyramid failure). Defer for the one-frame lookahead, which recovers
-     * the exact refresh_frame_flags and keeps our DPB identical to the
-     * encoder's. */
-    return true;
-}
-
-uint8_t Av1AccessUnitBuilder::reconstruct_refresh_flags(
-    const VADecPictureParameterBufferAV1& held, const VASurfaceID next_ref_frame_map[8]) const
-{
-    /* Frame N wrote itself into exactly the slots that hold its own surface in
-     * frame N+1's pre-decode ref_frame_map but did not in N's own (5.9.2 /
-     * decode_frame_wrapup): RefFrameMap[i] = current_frame for the refreshed i,
-     * unchanged otherwise. N and N+1 are consecutive in decode order, so N+1's
-     * map is exactly N's map with N's refreshes applied. */
-    const VASurfaceID self = held.current_frame;
+    /*
+     * THE exact derivation (5.9.2 decode_frame_wrapup). After frame N decodes,
+     * the decoder sets RefFrameMap[i] = current_frame for every i in
+     * refresh_frame_flags and leaves the other slots untouched. Frame N+1 is the
+     * next frame in DECODE order, and VA hands it that very map (ref_frame_map,
+     * the DPB BEFORE N+1 updates it), so:
+     *
+     *   refresh_frame_flags(N) = OR{ 1 << i : ref_frame_map_{N+1}[i] == current_frame_N }
+     *
+     * A surface only appears in the map by being written there, and a frame's own
+     * surface cannot be live in the map it is handed (a client never decodes into
+     * a picture its own DPB still holds), so every set bit is one this frame
+     * wrote. A mask of 0 is a legitimate answer: a never-referenced leaf of a
+     * B-pyramid refreshes nothing.
+     */
     uint8_t mask = 0;
     for (int i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
-        const bool now_self = (next_ref_frame_map[i] == self);
-        const bool was_self = (held.ref_frame_map[i] == self);
-        if (now_self && !was_self) {
+        if (next_ref_frame_map[i] == current_frame) {
             mask |= static_cast<uint8_t>(1u << i);
         }
     }
@@ -1513,13 +1506,34 @@ Av1AccessUnitBuilder::PictureResult Av1AccessUnitBuilder::submit_picture(uint64_
 {
     PictureResult result;
 
+    /* 0. A frame flush() had to emit before its mask could be derived went out
+     * with refresh_frame_flags = 0, so it is NOT in the codec's DPB. This frame's
+     * ref_frame_map now says which slots the encoder put it in: re-submit it as a
+     * HIDDEN catch-up frame (same bytes, so the same picture and CDFs) spliced
+     * into the next temporal unit, ahead of any frame that references it. A mask
+     * of 0 means the encoder kept it out of the DPB too -- nothing to do -- and a
+     * key frame resets the DPB, which makes the catch-up pointless. */
+    if (provisional_) {
+        if (has_picture_) {
+            const uint8_t refresh = derive_refresh_frame_flags(provisional_->pic.current_frame, picture_.ref_frame_map);
+            const bool key_resets = (picture_.pic_info_fields.bits.frame_type == AV1_KEY_FRAME);
+            if (refresh != 0 && !key_resets) {
+                catch_up_ = assemble_au(provisional_->pic, provisional_->tiles, provisional_->data, refresh,
+                    /*shown=*/false, /*bare=*/true);
+                update_dpb(provisional_->pic);
+            }
+        }
+        provisional_.reset();
+    }
+
     /* 1. A frame held for the lookahead: this frame's ref_frame_map is the DPB
      * after the held frame updated it, so it pins down what the held frame
      * refreshed. Build and release it before touching the current frame so it is
      * never lost (even if the current frame fails). */
     if (pending_) {
-        const uint8_t refresh = has_picture_ ? reconstruct_refresh_flags(pending_->pic, picture_.ref_frame_map)
-                                             : choose_refresh_flags(pending_->pic); /* no successor: best effort */
+        const uint8_t refresh = has_picture_
+            ? derive_refresh_frame_flags(pending_->pic.current_frame, picture_.ref_frame_map) /* EXACT */
+            : choose_refresh_flags(pending_->pic); /* no successor: best effort */
         std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
         update_dpb(pending_->pic);
         result.ready.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
@@ -1540,9 +1554,13 @@ Av1AccessUnitBuilder::PictureResult Av1AccessUnitBuilder::submit_picture(uint64_
     const unsigned frame_type = picture_.pic_info_fields.bits.frame_type;
     const bool is_key = (frame_type == AV1_KEY_FRAME);
 
-    if (!is_key && refresh_is_ambiguous(picture_)) {
-        /* Hold it: its refresh_frame_flags cannot be chosen without the next
-         * frame's ref_frame_map. Its surface is already bound to `tag`. */
+    if (!is_key) {
+        /* Hold it: refresh_frame_flags is only EXACT once the next frame's
+         * ref_frame_map arrives, and choosing one now (the old heuristic) writes
+         * this frame into slots the encoder never wrote -- which is what made the
+         * re-synthesised stream invalid AV1. Its surface is already bound to
+         * `tag`; flush() emits it if no successor ever comes. A key frame needs no
+         * successor: a shown key refreshes all 8 slots by definition. */
         PendingFrame pf;
         pf.pic = picture_;
         pf.tiles.assign(tile_params_.begin(), tile_params_.end());
@@ -1567,12 +1585,16 @@ std::vector<Av1AccessUnitBuilder::ReadyFrame> Av1AccessUnitBuilder::flush()
 {
     std::vector<ReadyFrame> out;
     if (pending_) {
-        /* No successor to reconstruct from: a best-effort mask is fine, nothing
-         * references the tail frame after it. */
-        const uint8_t refresh = choose_refresh_flags(pending_->pic);
-        std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, refresh);
+        /* No successor yet, so the mask cannot be derived. Emit the frame
+         * PROVISIONALLY with refresh_frame_flags = 0 -- the only mask that cannot
+         * evict a live picture -- and keep it: the next picture derives its true
+         * mask and re-submits it as a hidden DPB catch-up frame. At end of stream
+         * no successor ever comes, and then 0 is also the right answer (nothing
+         * can reference the tail frame). */
+        std::vector<uint8_t> au = assemble_au(pending_->pic, pending_->tiles, pending_->data, 0);
         update_dpb(pending_->pic);
-        out.push_back({ pending_->tag, std::move(au), refresh, pending_->pic.order_hint });
+        out.push_back({ pending_->tag, std::move(au), 0, pending_->pic.order_hint });
+        provisional_ = std::move(*pending_);
         pending_.reset();
     }
     return out;

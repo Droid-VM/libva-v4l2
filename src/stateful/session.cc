@@ -768,6 +768,19 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
     if (dead_) {
         throw std::runtime_error("session is dead");
     }
+
+    /* Diagnostic (env LIBVA_V4L2_AV1_DUMP): append every submitted access unit to
+     * that file, so the exact bytes the codec is fed can be replayed through a
+     * reference decoder off the device -- `ffmpeg -c:v libdav1d -i dump.obu -f
+     * null -` must report 0 decode errors. Off by default and byte-identical
+     * when unset; concatenated raw AUs form a valid elementary stream (each
+     * starts with a temporal delimiter). */
+    if (const char* dump = getenv("LIBVA_V4L2_AV1_DUMP")) {
+        if (FILE* fp = fopen(dump, "ab")) {
+            fwrite(access_unit.data(), 1, access_unit.size(), fp);
+            fclose(fp);
+        }
+    }
     if (access_unit.empty()) {
         throw std::invalid_argument("empty access unit");
     }

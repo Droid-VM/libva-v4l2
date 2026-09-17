@@ -37,7 +37,10 @@
  *      round-trips -- this directly guards the fix for the shipped gst bit
  *      writer bug (it can only encode lr_unit_shift == 2), which would otherwise
  *      make most real inter frames unparseable;
- *  (E) segmentation is rejected (the gst writer does not support it).
+ *  (E) segmentation is rejected (the gst writer does not support it);
+ *  (F) refresh_frame_flags is DERIVED EXACTLY from the next frame's
+ *      ref_frame_map (VA3-refreshfix), including the provisional / hidden
+ *      catch-up path a client that syncs every frame forces.
  */
 
 #include <algorithm>
@@ -118,6 +121,51 @@ ParsedAu parse_au(GstAV1Parser* parser, const std::vector<uint8_t>& au)
                         obu.data + tg.entry[i].tile_offset + tg.entry[i].tile_size);
                 }
             }
+            break;
+        }
+        default:
+            break;
+        }
+        off += consumed;
+    }
+    return out;
+}
+
+/* Every frame header in one access unit, in order (a temporal unit may carry a
+ * hidden DPB catch-up frame ahead of the shown frame). */
+std::vector<GstAV1FrameHeaderOBU> parse_au_frames(GstAV1Parser* parser, const std::vector<uint8_t>& au)
+{
+    std::vector<GstAV1FrameHeaderOBU> out;
+    size_t off = 0;
+    while (off < au.size()) {
+        GstAV1OBU obu;
+        guint32 consumed = 0;
+        if (gst_av1_parser_identify_one_obu(parser, au.data() + off, au.size() - off, &obu, &consumed)
+            != GST_AV1_PARSER_OK) {
+            break;
+        }
+        switch (obu.obu_type) {
+        case GST_AV1_OBU_TEMPORAL_DELIMITER:
+            gst_av1_parser_parse_temporal_delimiter_obu(parser, &obu);
+            break;
+        case GST_AV1_OBU_SEQUENCE_HEADER: {
+            GstAV1SequenceHeaderOBU seq;
+            gst_av1_parser_parse_sequence_header_obu(parser, &obu, &seq);
+            break;
+        }
+        case GST_AV1_OBU_FRAME_HEADER: {
+            GstAV1FrameHeaderOBU frame;
+            memset(&frame, 0, sizeof(frame));
+            if (gst_av1_parser_parse_frame_header_obu(parser, &obu, &frame) == GST_AV1_PARSER_OK) {
+                out.push_back(frame);
+                gst_av1_parser_reference_frame_update(parser, &frame);
+            }
+            break;
+        }
+        case GST_AV1_OBU_TILE_GROUP: {
+            GstAV1TileGroupOBU tg;
+            memset(&tg, 0, sizeof(tg));
+            gst_av1_parser_parse_tile_group_obu(parser, &obu, &tg);
             break;
         }
         default:
@@ -471,6 +519,210 @@ void test_random_access_refresh_lookahead()
     gst_av1_parser_free(parser);
 }
 
+/*
+ * (F1) THE derivation, on its own: frame N wrote itself into exactly the slots
+ * that hold N's surface once N+1 sees the DPB. Pure function, no builder state.
+ *
+ * The NAMED MUTATION guard -- "fill-every-dead-slot, else evict the oldest"
+ * (the heuristic this fix replaces, which VA3-mcmatrix measured emitting an
+ * INVALID stream: 245 of 305 inter frames referencing the wrong picture, 40 of
+ * 300 frames decodable) -- is computed over the SAME state and asserted to give
+ * a DIFFERENT answer, so this test would fail if the heuristic came back.
+ */
+uint8_t mutation_fill_dead_else_oldest(
+    const VASurfaceID mirror[8], const uint32_t mirror_hint[8], const VASurfaceID va_map[8])
+{
+    uint8_t mask = 0;
+    for (int j = 0; j < 8; j++) {
+        bool live = false;
+        for (int k = 0; k < 8; k++) {
+            live = live || (va_map[k] == mirror[j]);
+        }
+        if (!live) {
+            mask |= static_cast<uint8_t>(1u << j);
+        }
+    }
+    if (mask != 0) {
+        return mask;
+    }
+    int oldest = 0;
+    for (int j = 1; j < 8; j++) {
+        if (mirror_hint[j] < mirror_hint[oldest]) {
+            oldest = j;
+        }
+    }
+    return static_cast<uint8_t>(1u << oldest);
+}
+
+void test_refresh_derivation_exact()
+{
+    const VASurfaceID self = 4242;
+
+    /* One slot -- the ordinary single-slot encoder refresh. */
+    const VASurfaceID one[8] = { 10, 11, self, 13, 14, 15, 16, 17 };
+    CHECK_EQ(stateful::derive_refresh_frame_flags(self, one), 0x04);
+
+    /* Two slots at once (an anchor duplicated into GOLDEN and ALTREF). */
+    const VASurfaceID two[8] = { self, 11, 12, 13, 14, 15, 16, self };
+    CHECK_EQ(stateful::derive_refresh_frame_flags(self, two), 0x81);
+
+    /* A never-referenced leaf of the B-pyramid: the encoder kept it OUT of the
+     * DPB, and 0 is the exact answer -- not a failure to find a slot. */
+    const VASurfaceID leaf[8] = { 10, 11, 12, 13, 14, 15, 16, 17 };
+    CHECK_EQ(stateful::derive_refresh_frame_flags(self, leaf), 0x00);
+
+    /* A shown key frame refreshes all eight. */
+    const VASurfaceID all[8] = { self, self, self, self, self, self, self, self };
+    CHECK_EQ(stateful::derive_refresh_frame_flags(self, all), 0xFF);
+
+    /* The DPB is full of 8 DISTINCT live pictures -- the deep-B case the old
+     * heuristic could only guess at. The encoder refreshed slot 5; the heuristic
+     * would have evicted the oldest (slot 0, the key frame). */
+    const VASurfaceID mirror[8] = { 100, 132, 116, 108, 104, 102, 101, 103 };
+    const uint32_t hints[8] = { 0, 32, 16, 8, 4, 2, 1, 3 };
+    const VASurfaceID va_map[8] = { 100, 132, 116, 108, 104, 102, 101, 103 };
+    const VASurfaceID next_map[8] = { 100, 132, 116, 108, 104, self, 101, 103 };
+    const uint8_t exact = stateful::derive_refresh_frame_flags(self, next_map);
+    const uint8_t mutated = mutation_fill_dead_else_oldest(mirror, hints, va_map);
+    CHECK_EQ(exact, 0x20);
+    CHECK_EQ(mutated, 0x01);
+    CHECK(exact != mutated); /* the mutation is caught */
+}
+
+/*
+ * (F2) The client that syncs every shown frame (ffmpeg, Firefox: vaSyncSurface(N)
+ * before vaBeginPicture(N+1)) forces the held frame out before its mask can be
+ * derived. That frame must go out with refresh_frame_flags = 0 (the only mask
+ * that cannot evict a live picture) and must then be re-submitted as a HIDDEN
+ * catch-up frame carrying the derived mask, inside the next temporal unit, so
+ * the codec's DPB still matches the encoder's and a later frame can reference it.
+ */
+void test_provisional_flush_and_catch_up()
+{
+    GstAV1Parser* parser = gst_av1_parser_new();
+    Av1AccessUnitBuilder builder;
+
+    VASurfaceID model[8];
+    const VASurfaceID key_surface = 100;
+
+    /* Key frame: fills all eight slots. */
+    {
+        auto pic = make_pic(640, 480, 0 /* KEY */, 100);
+        pic.current_frame = key_surface;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = VA_INVALID_SURFACE;
+        }
+        VASliceParameterBufferAV1 sp;
+        memset(&sp, 0, sizeof(sp));
+        auto tile = fake_tile(32, 1);
+        sp.slice_data_size = static_cast<uint32_t>(tile.size());
+        builder.set_picture_parameters(pic);
+        builder.add_tile_parameters({ &sp, 1 });
+        builder.add_tile_data(tile);
+        auto result = builder.submit_picture(1);
+        CHECK(result.ready.size() == 1);
+        (void)parse_au_frames(parser, result.ready[0].access_unit);
+        for (int i = 0; i < 8; i++) {
+            model[i] = key_surface;
+        }
+    }
+
+    struct Step {
+        VASurfaceID cur;
+        uint8_t refresh; /* ground truth */
+        bool shown; /* the client syncs a shown frame immediately */
+    };
+    const Step steps[] = {
+        { 101, 0x01, false },
+        { 102, 0x02, false },
+        { 103, 0x04, true }, /* SYNCED -> provisional, then caught up into slot 2 */
+        { 104, 0x08, false }, /* references 103 through the mirrored DPB */
+        { 105, 0x10, true },
+    };
+    const size_t n_steps = sizeof(steps) / sizeof(steps[0]);
+
+    int provisional_zero = 0;
+    int catch_up_frames = 0;
+    int catch_up_exact = 0;
+    uint64_t tag = 2;
+
+    for (size_t k = 0; k < n_steps; k++) {
+        const Step& st = steps[k];
+        auto pic = make_pic(640, 480, 1 /* INTER */, 100);
+        pic.current_frame = st.cur;
+        pic.order_hint = static_cast<uint8_t>(k + 1);
+        pic.primary_ref_frame = 0;
+        pic.mode_control_fields.bits.reference_select = 1;
+        for (int i = 0; i < 8; i++) {
+            pic.ref_frame_map[i] = model[i];
+        }
+        /* Reference the frame two steps back through every position: once a
+         * synced frame has been caught up, this must still resolve. */
+        const VASurfaceID want = (k >= 1) ? steps[k - 1].cur : key_surface;
+        int want_slot = 7;
+        for (int i = 0; i < 8; i++) {
+            if (model[i] == want) {
+                want_slot = i;
+            }
+        }
+        for (int i = 0; i < 7; i++) {
+            pic.ref_frame_idx[i] = static_cast<uint8_t>(want_slot);
+        }
+
+        VASliceParameterBufferAV1 sp;
+        memset(&sp, 0, sizeof(sp));
+        auto tile = fake_tile(48, static_cast<uint8_t>(k + 2));
+        sp.slice_data_size = static_cast<uint32_t>(tile.size());
+        builder.set_picture_parameters(pic);
+        builder.add_tile_parameters({ &sp, 1 });
+        builder.add_tile_data(tile);
+        auto result = builder.submit_picture(tag++);
+
+        for (auto& rf : result.ready) {
+            auto parsed = parse_au_frames(parser, rf.access_unit);
+            CHECK(!parsed.empty());
+            if (parsed.size() > 1) {
+                /* The hidden catch-up frame rides ahead of the shown one. */
+                catch_up_frames++;
+                CHECK_EQ(parsed[0].show_frame, 0);
+                CHECK_EQ(parsed[parsed.size() - 1].show_frame, 1);
+                /* steps[2] is the synced frame; its ground truth is 0x04. */
+                if (parsed[0].refresh_frame_flags == steps[2].refresh) {
+                    catch_up_exact++;
+                }
+            }
+            /* Every reference resolves inside the mirrored DPB. */
+            for (int i = 0; i < 7; i++) {
+                CHECK(
+                    parsed[parsed.size() - 1].ref_frame_idx[i] >= 0 && parsed[parsed.size() - 1].ref_frame_idx[i] < 8);
+            }
+        }
+
+        /* The client syncs a shown frame before decoding the next one. */
+        if (st.shown) {
+            CHECK(builder.has_pending());
+            auto tail = builder.flush();
+            CHECK(tail.size() == 1);
+            CHECK_EQ(tail[0].refresh_frame_flags, 0); /* provisional: cannot evict */
+            provisional_zero++;
+            auto parsed = parse_au_frames(parser, tail[0].access_unit);
+            CHECK(parsed.size() == 1);
+            CHECK_EQ(parsed[0].show_frame, 1);
+        }
+
+        for (int i = 0; i < 8; i++) {
+            if (st.refresh & (1u << i)) {
+                model[i] = st.cur;
+            }
+        }
+    }
+
+    CHECK_EQ(provisional_zero, 2);
+    CHECK_EQ(catch_up_frames, 1); /* steps[2]; steps[4] has no successor */
+    CHECK_EQ(catch_up_exact, 1);
+    gst_av1_parser_free(parser);
+}
+
 void test_segmentation_rejected()
 {
     Av1AccessUnitBuilder builder;
@@ -504,6 +756,8 @@ int main()
     test_inter_roundtrip();
     test_loop_restoration_unit_shift_fix();
     test_random_access_refresh_lookahead();
+    test_refresh_derivation_exact();
+    test_provisional_flush_and_catch_up();
     test_segmentation_rejected();
 
     if (g_check_failures != 0) {
