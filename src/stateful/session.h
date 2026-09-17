@@ -265,14 +265,6 @@ private:
     uint64_t submit_count_ = 0; /* total submits; syncs watch it for input flow (D85) */
     unsigned timeout_recoveries_ = 0;
     unsigned idle_drains_ = 0;
-
-    /* VA3-sync-reorder investigation: behaviour-neutral tracing gated on
-     * LIBVA_V4L2_TRACE. Logs submit/capture/claim and, at a stalled sync, a
-     * full accounting (awaited sequence, stash contents, CAPTURE ownership,
-     * OUTPUT flow) so the reorder wedge mechanism can be read off directly. */
-    bool trace_ = false;
-    uint64_t delivered_ = 0; /* successful claims */
-    void trace_dump_locked(const char* tag, uint64_t await);
 };
 
 } // namespace stateful

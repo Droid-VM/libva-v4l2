@@ -25,8 +25,6 @@
 #include "av1_bitstream.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1048,9 +1046,6 @@ void Av1AccessUnitBuilder::build_frame_header(const VADecPictureParameterBufferA
                 }
             }
             f.ref_frame_idx[i] = (found >= 0) ? found : static_cast<gint8>(va_slot);
-            if (found < 0 && getenv("AV1DBG")) {
-                fprintf(stderr, "REMAP-MISS oh=%u ref[%d] wants surface %u not in DPB\n", pic.order_hint, i, want);
-            }
         }
     }
 
@@ -1379,10 +1374,6 @@ uint8_t Av1AccessUnitBuilder::choose_refresh_flags(const VADecPictureParameterBu
             < 0) {
             oldest = j;
         }
-    }
-    if (getenv("AV1DBG")) {
-        fprintf(stderr, "REFRESH-FULL oh=%u full DPB, evicting oldest slot %d (oh=%u)\n", pic.order_hint, oldest,
-            dpb_.slots[oldest].order_hint);
     }
     return static_cast<uint8_t>(1u << oldest);
 }
