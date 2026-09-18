@@ -32,6 +32,7 @@
 #include <system_error>
 
 extern "C" {
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -51,8 +52,35 @@ namespace {
 
 } // namespace
 
+namespace {
+
+    /* P-6b: one V4L2 open is one codec session. The display-wide fd that
+     * V4L2M2MDevice opened at vaInitialize is shared by every context of the
+     * display, so two stateful contexts alive at once in one VADisplay -- a
+     * browser that creates the next decoder before the previous one has been
+     * torn down (Firefox shares one VADisplay across its decoders; a looping
+     * <video>, or moving from one video page to the next) -- fought over one
+     * OUTPUT queue and the second vaCreateContext died with
+     * "VIDIOC_S_FMT(OUTPUT): Device or resource busy", which the browser
+     * answers with a silent software fallback. Each context therefore opens
+     * its own fd on the same node: its own queues, its own session, torn down
+     * with the context. */
+    int open_own_session(const std::string& path)
+    {
+        int fd;
+        do {
+            fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(), "open(" + path + ")");
+        }
+        return fd;
+    }
+
+} // namespace
+
 V4L2StatefulDevice::V4L2StatefulDevice(V4L2M2MDevice& m2m_device)
-    : fd_(m2m_device.video_fd)
+    : fd_(open_own_session(m2m_device.video_path))
     , output_type_(m2m_device.output_buf_type)
     , capture_type_(m2m_device.capture_buf_type)
 {
@@ -62,6 +90,7 @@ V4L2StatefulDevice::~V4L2StatefulDevice()
 {
     unmap_buffers(output_buffers_);
     unmap_buffers(capture_buffers_);
+    close(fd_);
 }
 
 int V4L2StatefulDevice::xioctl(unsigned long request, void* argument, const char* name)

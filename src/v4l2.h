@@ -87,6 +87,11 @@ public:
      * node and no Request API. */
     bool stateful_decoder() const;
 
+    /* The node this device was opened on. A stateful context opens ITS OWN fd
+     * on it (stateful/v4l2_device.cc): one V4L2 open is one codec session, and
+     * the display-wide video_fd below is shared by every context of the
+     * display. */
+    std::string video_path;
     int video_fd;
     int media_fd;
     const uint32_t capabilities;

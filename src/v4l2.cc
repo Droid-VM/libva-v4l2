@@ -394,7 +394,8 @@ std::vector<int> V4L2M2MDevice::Buffer::export_(unsigned flags) const
 }
 
 V4L2M2MDevice::V4L2M2MDevice(const std::string& video_path, const std::optional<std::string>& media_path)
-    : video_fd(errno_wrapper(open, video_path.c_str(), O_RDWR | O_NONBLOCK))
+    : video_path(video_path)
+    , video_fd(errno_wrapper(open, video_path.c_str(), O_RDWR | O_NONBLOCK))
     , media_fd((media_path) ? errno_wrapper(open, media_path->c_str(), O_RDWR | O_NONBLOCK) : -1)
     , capabilities(query_capabilities(video_fd))
     , capture_buf_type(
@@ -410,7 +411,8 @@ V4L2M2MDevice::V4L2M2MDevice(const std::string& video_path, const std::optional<
 }
 
 V4L2M2MDevice::V4L2M2MDevice(V4L2M2MDevice&& other)
-    : video_fd(std::move(other.video_fd))
+    : video_path(std::move(other.video_path))
+    , video_fd(std::move(other.video_fd))
     , media_fd(std::move(other.media_fd))
     , capabilities(std::move(other.capabilities))
     , capture_buf_type(std::move(other.capture_buf_type))
