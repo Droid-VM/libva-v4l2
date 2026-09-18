@@ -29,8 +29,6 @@
 #include <optional>
 #include <set>
 #include <span>
-#include <utility>
-#include <vector>
 
 extern "C" {
 #include <va/va_backend.h>
@@ -126,21 +124,6 @@ private:
     mutable std::mutex builder_mutex_;
     mutable stateful::H264AccessUnitBuilder au_builder_;
     uint64_t next_sequence_ = 1;
-    /* D91: sequences of the access units the builder is still holding while
-     * the client's reorder depth is unknown, oldest first. Guarded by
-     * builder_mutex_. */
-    std::vector<uint64_t> held_sequences_;
-
-    /* D91: serialise whatever the builder is holding and queue it. reorder is
-     * the depth observed from the client, std::nullopt for the conservative
-     * fallback. Returns the (sequence, access unit) pairs to submit; the
-     * caller submits OUTSIDE builder_mutex_ because submit() waits on the
-     * session. */
-    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> take_held_locked(std::optional<unsigned> reorder);
-    void submit_access_units(
-        VADriverContextP va_context, std::vector<std::pair<uint64_t, std::vector<uint8_t>>>& units);
     /* 7.7 (4): the derive-unavailable reason is logged once per context. */
     std::atomic<bool> derive_unavailable_logged_ { false };
-    /* D91: the observed reorder depth is logged once per context. */
-    std::atomic<bool> reorder_logged_ { false };
 };

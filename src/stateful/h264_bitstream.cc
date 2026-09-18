@@ -220,8 +220,7 @@ std::optional<H264SliceHeaderInfo> parse_slice_header_info(std::span<const uint8
 
 H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& picture,
     const VAIQMatrixBufferH264* iq_matrix, VAProfile profile, unsigned display_width, unsigned display_height,
-    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1,
-    unsigned max_num_reorder_frames)
+    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1)
 {
     H264ParameterSets sets = {};
     GstH264SPS& sps = sets.sps;
@@ -315,20 +314,44 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
      * frames in display order and stops feeding input while it waits, so the
      * decoder must not hold back more frames than the DPB implies.
      *
-     * D91: max_num_reorder_frames is exactly how many pictures the decoder is
-     * allowed to hold before its first output, and it is the whole of D91.
-     * num_ref_frames was used as a stand-in and it is an upper bound that is
-     * normally far too large: the adaptive High stream has 5 reference frames
-     * and a real reorder depth of 2, so we told the codec it could hold 5 and
-     * it duly consumed 6 access units before its first output -- precisely the
-     * "c2.qti.avc.decoder needs ~6 High-profile pictures before SOURCE_CHANGE"
-     * threshold B26 measured, and twice the ~3 access units a browser feeds
-     * before its first blocking vaSyncSurface. The threshold was ours.
+     * D91 is this one field. max_num_reorder_frames is how many pictures the
+     * decoder is ALLOWED to sit on before its first output, and a decoder that
+     * is allowed to sit on N produces nothing until access unit N + 1 (plus
+     * its own pipeline). VA carries no reorder depth, so num_ref_frames was
+     * used as a stand-in -- a safe upper bound that is, on real streams,
+     * enormous. The adaptive High stream in the D91 record declares 5
+     * reference frames against a true reorder depth of 2, so we told
+     * c2.qti.avc.decoder it could hold 5 and it duly waited for the 6th access
+     * unit: exactly the "the codec needs ~6 High-profile pictures before
+     * SOURCE_CHANGE" threshold B26 measured and B23-B29 spent six rounds
+     * attributing to Qualcomm. Firefox feeds 3 and blocks on vaSyncSurface, so
+     * the grace expired, the sequence-1 sync failed, vaExportSurfaceHandle
+     * failed, and it fell back to software. Constrained Baseline escaped only
+     * because num_ref_frames is 1 there.
      *
-     * The caller passes the observed value instead (H264AccessUnitBuilder).
-     * max_dec_frame_buffering stays at the full DPB: it governs how many
-     * pictures may be RETAINED, which references depend on, not how long the
-     * decoder may sit on them before output. */
+     * 0 is the right value HERE, and it is a statement about this transport
+     * rather than about the content. Output ORDER carries no information on
+     * this path: every access unit is queued with its sequence as the V4L2
+     * timestamp and the CAPTURE buffer is claimed by that tag (session.cc), so
+     * the client is handed the picture it submitted whatever order the decoder
+     * emits in -- and a VA client always reorders for itself, out of the DPB
+     * it owns and whose POCs it has just handed us. What the client cannot
+     * absorb is output LATENCY, because it blocks on the picture it has just
+     * submitted. So ask the decoder to bump each picture as soon as it is
+     * decoded.
+     *
+     * Measured, not assumed, on the phone. Sub-threshold browser-free repro
+     * (B28's `-flags low_delay`: a 3-access-unit feeder, the Firefox shape) --
+     * declared 0 or 1 gets past the first sync, declared 2, 3 or 5 stalls at 3
+     * fed / 0 out. Full decode of the same fixture -- declared 0 gives
+     * byte-identical output to declared 2, 3 and 5. Host-direct MediaCodec
+     * probe against c2.qti.avc.decoder -- declared 0 delivers 300/300 in the
+     * same delivery order as the native stream, so the decoder neither drops
+     * pictures nor reorders differently; it only starts sooner.
+     *
+     * max_dec_frame_buffering is deliberately left at the full DPB: it governs
+     * what may be RETAINED, which references depend on, not how long output
+     * may be withheld. */
     sps.vui_parameters_present_flag = 1;
     GstH264VUIParams& vui = sps.vui_parameters;
     vui.bitstream_restriction_flag = 1;
@@ -337,8 +360,8 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
     vui.max_bits_per_mb_denom = 1;
     vui.log2_max_mv_length_horizontal = 15;
     vui.log2_max_mv_length_vertical = 15;
+    vui.num_reorder_frames = 0;
     vui.max_dec_frame_buffering = std::max<uint32_t>(picture.num_ref_frames, 1u);
-    vui.num_reorder_frames = std::min<uint32_t>(max_num_reorder_frames, vui.max_dec_frame_buffering);
 
     pps.id = static_cast<gint>(pps_id);
     pps.sequence = &sps;
@@ -433,74 +456,34 @@ void H264AccessUnitBuilder::add_slice_data(std::span<const uint8_t> data)
     pending_slice_params_.clear();
 }
 
-std::vector<uint8_t> H264AccessUnitBuilder::serialize(HeldAccessUnit& unit, unsigned max_num_reorder_frames)
+std::vector<uint8_t> H264AccessUnitBuilder::finish(unsigned display_width, unsigned display_height)
 {
-    unit.sets.sps.vui_parameters.num_reorder_frames
-        = std::min<uint32_t>(max_num_reorder_frames, unit.sets.sps.vui_parameters.max_dec_frame_buffering);
-
-    auto parameter_bytes = write_parameter_sets(unit.sets);
     std::vector<uint8_t> access_unit;
-    if (unit.idr || parameter_bytes != last_emitted_parameter_sets_) {
-        access_unit = parameter_bytes;
-        last_emitted_parameter_sets_ = std::move(parameter_bytes);
-    }
-    access_unit.insert(access_unit.end(), unit.slices.begin(), unit.slices.end());
-    return access_unit;
-}
-
-std::vector<std::vector<uint8_t>> H264AccessUnitBuilder::flush_held(std::optional<unsigned> max_num_reorder_frames)
-{
-    /* Without an observation fall back to the conservative upper bound the
-     * pre-D91 code always used. */
-    max_num_reorder_frames_ = max_num_reorder_frames.value_or(last_num_ref_frames_);
-
-    std::vector<std::vector<uint8_t>> access_units;
-    access_units.reserve(held_.size());
-    for (auto& unit : held_) {
-        access_units.push_back(serialize(unit, *max_num_reorder_frames_));
-    }
-    held_.clear();
-    return access_units;
-}
-
-H264AccessUnitBuilder::FinishResult H264AccessUnitBuilder::finish(unsigned display_width, unsigned display_height)
-{
-    FinishResult result;
 
     if (!has_picture_ || slice_bytes_.empty() || !first_slice_) {
         pending_slice_params_.clear();
         slice_bytes_.clear();
         first_slice_.reset();
-        return result;
+        return access_unit;
     }
-    result.had_picture = true;
 
-    HeldAccessUnit unit;
-    unit.sets = synthesize_parameter_sets(picture_, has_iq_matrix_ ? &iq_matrix_ : nullptr, profile_, display_width,
-        display_height, first_slice_->pps_id, first_num_ref_idx_l0_, first_num_ref_idx_l1_,
-        /* filled in by serialize() */ 0);
-    unit.idr = first_slice_->nal_unit_type == 5 /* GST_H264_NAL_SLICE_IDR */;
-    unit.slices = std::move(slice_bytes_);
+    auto sets = synthesize_parameter_sets(picture_, has_iq_matrix_ ? &iq_matrix_ : nullptr, profile_, display_width,
+        display_height, first_slice_->pps_id, first_num_ref_idx_l0_, first_num_ref_idx_l1_);
+    auto parameter_bytes = write_parameter_sets(sets);
+
+    const bool idr = first_slice_->nal_unit_type == 5 /* GST_H264_NAL_SLICE_IDR */;
+    if (idr || parameter_bytes != last_emitted_parameter_sets_) {
+        access_unit = parameter_bytes;
+        last_emitted_parameter_sets_ = std::move(parameter_bytes);
+    }
+    access_unit.insert(access_unit.end(), slice_bytes_.begin(), slice_bytes_.end());
 
     has_picture_ = false;
-    last_num_ref_frames_ = picture_.num_ref_frames;
     /* iq_matrix_ is sticky: clients may send it once per sequence. */
     pending_slice_params_.clear();
     slice_bytes_.clear();
     first_slice_.reset();
-
-    if (max_num_reorder_frames_) {
-        result.access_units.push_back(serialize(unit, *max_num_reorder_frames_));
-        return result;
-    }
-
-    held_.push_back(std::move(unit));
-    if (held_.size() >= kMaxHeldAccessUnits) {
-        /* The client is feeding ahead, so it is not waiting on us and cannot
-         * deadlock; stop holding and keep the conservative bound. */
-        result.access_units = flush_held(std::nullopt);
-    }
-    return result;
+    return access_unit;
 }
 
 } // namespace stateful
