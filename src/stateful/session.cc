@@ -51,13 +51,31 @@ namespace {
      *  - kDefaultMidstreamIdleMs, on the path that may actually drain mid-stream
      *    (H.264): a WRONG guess here costs the stream. A drain resets the codec
      *    and the next non-IDR access unit decodes against nothing, so the price
-     *    of guessing "end of stream" too early is the whole rest of the video --
-     *    D91 and P4-verify both measured Firefox taking two drains at the old
-     *    50 ms window and falling back to software. The price of guessing too
-     *    late is paid once, at the real end of stream: the last few frames of a
-     *    reordered stream arrive this much later. Those costs are not
-     *    comparable, so the window sits far above any pacing gap a live client
-     *    plausibly has (measured: Firefox MSE, see logs/vpu_wp/D85-drain.md).
+     *    of guessing "end of stream" too early is the whole rest of the video.
+     *    The price of guessing too late is paid once, at the real end of
+     *    stream: the last few frames of a reordered stream arrive this much
+     *    later. Those costs are not comparable, so the window sits far above
+     *    any inter-submit gap a live client plausibly has -- measured on the
+     *    phone (logs/vpu_wp/D85-drain.md): a client paced at 30 fps submits
+     *    every 30-50 ms, which straddles the 50 ms this used to be.
+     *
+     *    What the same measurement ALSO says, and what this constant therefore
+     *    does NOT fix: when Firefox's MSE pipeline stalls, its pause is not its
+     *    own pacing -- it is BLOCKED IN THE SYNC. Sweeping this window over
+     *    50/1000/3000/8000 ms leaves the outcome bit-identical (8 access units
+     *    fed, md5 188cd449..., 2 drains, one failed sync, software fallback) and
+     *    only stretches the wall clock, because the client submits again exactly
+     *    when our drain releases it. That stall is the reorder deadlock of 7.6
+     *    point 5: the client has fed fewer pictures than the codec's own output
+     *    delay and will not feed more until it gets the frame it is waiting for.
+     *    No threshold can tell that apart from end of stream, and the only
+     *    escape this interface offers -- DEC_CMD_STOP -- is what costs the
+     *    references (the device ledger names it: "input after EOS: flushing to
+     *    restart"). Breaking it needs either the codec's low-latency mode (the
+     *    device logs "low-latency off" today, and it is not a control this
+     *    backend can reach) or pushing the pipeline with duplicate access units
+     *    rather than a drain (B30 measured the device accepting duplicates with
+     *    no error, refusal or seek). Both are outside this file.
      *  - kDefaultSyncIdleMs, where no mid-stream drain can fire (AV1/VP9,
      *    allow_midstream_drain = false): nothing is triggered by it there, it
      *    only bounds the poll slice, so it stays what it always was. */
