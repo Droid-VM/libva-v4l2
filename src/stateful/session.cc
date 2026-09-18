@@ -46,40 +46,31 @@ namespace {
 
     constexpr int kDefaultSyncTimeoutMs = 500;
     /* D85: the quiet window that stands in for the end-of-stream signal VA-API
-     * does not have. Two values, because the window means two different things:
+     * does not have. A waiting sync drains only once the pipeline has been
+     * quiet -- no new access unit submitted AND no decoded frame dequeued --
+     * for this long; the hard cap (sync_timeout_ms_) never drains on its own
+     * any more, it only feeds the backstop (midstream_stall_ms_).
      *
-     *  - kDefaultMidstreamIdleMs, on the path that may actually drain mid-stream
-     *    (H.264): a WRONG guess here costs the stream. A drain resets the codec
-     *    and the next non-IDR access unit decodes against nothing, so the price
-     *    of guessing "end of stream" too early is the whole rest of the video.
-     *    The price of guessing too late is paid once, at the real end of
-     *    stream: the last few frames of a reordered stream arrive this much
-     *    later. Those costs are not comparable, so the window sits far above
-     *    any inter-submit gap a live client plausibly has -- measured on the
-     *    phone (logs/vpu_wp/D85-drain.md): a client paced at 30 fps submits
-     *    every 30-50 ms, which straddles the 50 ms this used to be.
-     *
-     *    What the same measurement ALSO says, and what this constant therefore
-     *    does NOT fix: when Firefox's MSE pipeline stalls, its pause is not its
-     *    own pacing -- it is BLOCKED IN THE SYNC. Sweeping this window over
-     *    50/1000/3000/8000 ms leaves the outcome bit-identical (8 access units
-     *    fed, md5 188cd449..., 2 drains, one failed sync, software fallback) and
-     *    only stretches the wall clock, because the client submits again exactly
-     *    when our drain releases it. That stall is the reorder deadlock of 7.6
-     *    point 5: the client has fed fewer pictures than the codec's own output
-     *    delay and will not feed more until it gets the frame it is waiting for.
-     *    No threshold can tell that apart from end of stream, and the only
-     *    escape this interface offers -- DEC_CMD_STOP -- is what costs the
-     *    references (the device ledger names it: "input after EOS: flushing to
-     *    restart"). Breaking it needs either the codec's low-latency mode (the
-     *    device logs "low-latency off" today, and it is not a control this
-     *    backend can reach) or pushing the pipeline with duplicate access units
-     *    rather than a drain (B30 measured the device accepting duplicates with
-     *    no error, refusal or seek). Both are outside this file.
-     *  - kDefaultSyncIdleMs, where no mid-stream drain can fire (AV1/VP9,
-     *    allow_midstream_drain = false): nothing is triggered by it there, it
-     *    only bounds the poll slice, so it stays what it always was. */
-    constexpr int kDefaultMidstreamIdleMs = 1000;
+     * 50 ms, the value it always had, and here is why it is not larger. The one
+     * client this window was measured to hurt (Firefox MSE, adaptive High
+     * profile) was never pausing on its own pacing: it was BLOCKED IN THE SYNC,
+     * waiting for the picture it had just submitted while the codec held that
+     * picture for display-order reorder (self-delay p95 = 7 access units
+     * against a 7-8 feed-ahead). Sweeping this window over 50/1000/3000/8000 ms
+     * left that outcome bit-identical (8 access units fed, 2 drains, one failed
+     * sync, software fallback) and only stretched the wall clock
+     * (logs/vpu_wp/D85-drain.md): no threshold can tell that stall from end of
+     * stream. What removed it is upstream of this file -- crosvm now configures
+     * the AVC decoder for decode-order output (vendor.qti-ext-dec-picture-order,
+     * logs/vpu_wp/D91-deploy.md; the device ledger prints "picture-order on").
+     * With that, nothing is held mid-stream and the reorder tail is not held at
+     * end of stream either: every shipped path measured (three H.264 clips,
+     * h264.html, MSE adaptive High, YouTube avc1) ran with this window firing
+     * zero drains. The window is dormant on those paths and stays only as the
+     * last-resort EOS guess for an AVC codec that does hold pictures (a device
+     * without that key, or one that ignores it); a larger value would just
+     * delay that one drain. Where no mid-stream drain can fire (AV1/VP9,
+     * allow_midstream_drain = false) it only bounds the poll slice. */
     constexpr int kDefaultSyncIdleMs = 50;
     constexpr int kDefaultProvisionRetryMs = 2000;
     constexpr int kProvisionRetryStepMs = 50;
@@ -102,7 +93,7 @@ namespace {
         return kDefaultSyncTimeoutMs;
     }
 
-    int resolve_sync_idle(int configured, bool midstream_drain)
+    int resolve_sync_idle(int configured)
     {
         if (configured >= 0) {
             return configured;
@@ -114,7 +105,7 @@ namespace {
                 return static_cast<int>(value);
             }
         }
-        return midstream_drain ? kDefaultMidstreamIdleMs : kDefaultSyncIdleMs;
+        return kDefaultSyncIdleMs;
     }
 
     /* The gap histogram's upper edges, in ms (the last bucket is everything
@@ -148,7 +139,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , allocator_(options.allocator)
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
-    , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms, options.allow_midstream_drain))
+    , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
     , midstream_stall_ms_(std::max(sync_timeout_ms_, 3 * sync_idle_ms_))
     , allow_midstream_drain_(options.allow_midstream_drain)
     , provision_retry_ms_(options.provision_retry_ms >= 0 ? options.provision_retry_ms : kDefaultProvisionRetryMs)

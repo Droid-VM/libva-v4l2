@@ -51,10 +51,9 @@ StatefulSession::Options fast_options()
     options.num_surfaces = 6;
     options.output_ring_size = 4;
     options.sync_timeout_ms = 30; /* keep the stall tests fast */
-    /* D85: the quiet window the mid-stream drain now triggers on. The shipped
-     * default is a second (kDefaultMidstreamIdleMs), which is the point of the
-     * fix and far too long for a unit test; every stall test scales it down the
-     * same way it scales the hard cap. */
+    /* D85: the quiet window the mid-stream drain triggers on (the hard cap
+     * alone no longer does). Set explicitly so the stall tests do not depend
+     * on the shipped default, and scaled with the hard cap. */
     options.sync_idle_ms = 30;
     return options;
 }
@@ -422,7 +421,7 @@ void test_paced_client_is_not_end_of_stream()
     options.num_surfaces = 6;
     options.output_ring_size = 8;
     options.sync_timeout_ms = 40; /* the pre-D85 trigger: below the client's own pace */
-    options.sync_idle_ms = 150; /* the quiet window, scaled down from 1000 ms */
+    options.sync_idle_ms = 150; /* the quiet window, deliberately above the cap */
     StatefulSession session(device, 0x34363248, 1920, 1088, options);
     CHECK_EQ(session.midstream_stall_ms(), 450); /* max(40, 3 x 150) */
 
@@ -514,16 +513,16 @@ void test_backstop_drains_a_moving_pipeline()
 
 void test_drain_window_defaults()
 {
-    /* The shipped numbers, because they ARE the fix: a mid-stream drain costs
-     * the rest of the stream (the codec restarts with no references and every
-     * non-IDR access unit after it decodes against nothing), while waiting too
-     * long costs the last few frames of one stream a little latency, once. The
-     * two are not comparable, so the quiet window sits far above any pacing gap
-     * a live client plausibly has. Where no mid-stream drain can fire (AV1/VP9)
-     * the window triggers nothing and stays what it always was.
+    /* The shipped numbers. The quiet window is 50 ms on every codec path: on
+     * AVC it is dormant now that crosvm puts the codec in decode order (D91 --
+     * nothing is held, so nothing drains), and on AV1/VP9 it only paces the
+     * poll. What the D85 fix changed is the SHAPE, not the number: the hard
+     * cap never drains by itself, it only feeds the backstop, which is
+     * max(cap, 3 x window). Both are field-tunable without a rebuild.
      *
-     * Named mutation this fails under: resolve_sync_idle returning
-     * kDefaultSyncIdleMs whatever the codec (the pre-D85 50 ms). */
+     * Named mutations this fails under: a default window other than 50 ms; a
+     * backstop that is not max(cap, 3 x window); LIBVA_V4L2_SYNC_IDLE_MS
+     * ignored. */
     unsetenv("LIBVA_V4L2_SYNC_IDLE_MS");
     unsetenv("LIBVA_V4L2_SYNC_TIMEOUT_MS");
     {
@@ -531,9 +530,9 @@ void test_drain_window_defaults()
         StatefulSession::Options options; /* H.264: allow_midstream_drain defaults true */
         options.num_surfaces = 6;
         StatefulSession session(device, 0x34363248, 1920, 1088, options);
-        CHECK_EQ(session.sync_idle_ms(), 1000);
+        CHECK_EQ(session.sync_idle_ms(), 50);
         CHECK_EQ(session.sync_timeout_ms(), 500);
-        CHECK_EQ(session.midstream_stall_ms(), 3000);
+        CHECK_EQ(session.midstream_stall_ms(), 500); /* max(500, 3 x 50) */
     }
     {
         FakeDevice device;
@@ -543,6 +542,7 @@ void test_drain_window_defaults()
         StatefulSession session(device, 0x34363248, 1920, 1088, options);
         CHECK_EQ(session.sync_idle_ms(), 50);
         CHECK_EQ(session.sync_timeout_ms(), 500);
+        CHECK_EQ(session.midstream_stall_ms(), 500);
     }
     /* Tunable for the field without a rebuild (the value the phone sweeps). */
     setenv("LIBVA_V4L2_SYNC_IDLE_MS", "250", 1);

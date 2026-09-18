@@ -73,19 +73,15 @@ public:
         int sync_timeout_ms = -1;
         /* D85: how long the pipeline must be QUIET -- no new access unit
          * submitted AND no new decoded frame dequeued -- before a waiting sync
-         * drains. VA-API has no EOS call, so a stream's tail sits in the codec
-         * until a drain shakes it loose and the client's sync of a tail frame
-         * can only be satisfied that way; a quiet pipeline is the only
-         * end-of-stream signal this interface has. That makes it a GUESS, and
-         * the threshold is what makes the guess safe: a paced streaming client
-         * (Firefox MSE appendBuffer, any network-fed player) routinely pauses
-         * between submits while a sync is outstanding, and a drain there resets
-         * the codec and cuts the reference chain -- D91/P4-verify measured
-         * Firefox falling back to software after two drains at the old 50 ms
-         * window. Default kDefaultMidstreamIdleMs on the mid-stream-drain
-         * (H.264) path; 50 ms where no mid-stream drain can fire, since there it
-         * only sets the poll cadence. < 0: LIBVA_V4L2_SYNC_IDLE_MS or the
-         * default. */
+         * drains. VA-API has no EOS call, so a tail the codec holds can only be
+         * shaken loose by a drain, and a quiet pipeline is the only end-of-
+         * stream signal this interface has. That makes it a GUESS; the hard
+         * cap alone never drains (it only feeds the backstop), because a drain
+         * in the middle of a live stream resets the codec and cuts the
+         * reference chain. Default 50 ms: on the AVC path that is now dormant
+         * (crosvm puts the codec in decode order, so it holds nothing -- D91),
+         * and where no mid-stream drain can fire (AV1/VP9) it only sets the
+         * poll cadence. < 0: LIBVA_V4L2_SYNC_IDLE_MS or the default. */
         int sync_idle_ms = -1;
         /* D85/D86: the mid-stream idle/timeout DEC_CMD_STOP drain
          * (recover_locked) exists for H.264, whose reorder tail the codec holds
