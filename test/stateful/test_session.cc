@@ -29,9 +29,12 @@
  * delivery, the timeout drain, OUTPUT ring growth, and the dead session.
  */
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../../src/stateful/session.h"
@@ -48,6 +51,11 @@ StatefulSession::Options fast_options()
     options.num_surfaces = 6;
     options.output_ring_size = 4;
     options.sync_timeout_ms = 30; /* keep the stall tests fast */
+    /* D85: the quiet window the mid-stream drain now triggers on. The shipped
+     * default is a second (kDefaultMidstreamIdleMs), which is the point of the
+     * fix and far too long for a unit test; every stall test scales it down the
+     * same way it scales the hard cap. */
+    options.sync_idle_ms = 30;
     return options;
 }
 
@@ -202,8 +210,14 @@ void test_drop_sequence_recycles()
     CHECK_EQ(device.free_captures.size(), captures_free - 1);
 }
 
-void test_timeout_drain_recovery()
+void test_stalled_sync_drain_recovery()
 {
+    /* A sync whose frame the codec is sitting on, with NOTHING else happening:
+     * no new access unit, no other frame coming back. That is the shape of a
+     * stream tail, and the drain is what gets the frame out (7.6 point 5b).
+     * Counted as an 'idle drain' -- since D85 the quiet pipeline is the trigger
+     * and the hard cap is not; the 'sync timeout' counter belongs to a
+     * pipeline that keeps MOVING (test_backstop_drains_a_moving_pipeline). */
     FakeDevice device;
     device.manual_delivery = true; /* the decoder holds everything back */
     StatefulSession session(device, 0x34363248, 1920, 1088, fast_options());
@@ -221,7 +235,8 @@ void test_timeout_drain_recovery()
 
     StatefulSession::Frame index1;
     CHECK(session.sync(1, &index1) == StatefulSession::SyncStatus::ok);
-    CHECK_EQ(session.timeout_recoveries(), 1u);
+    CHECK_EQ(session.idle_drains(), 1u);
+    CHECK_EQ(session.timeout_recoveries(), 0u);
     CHECK_EQ(device.decoder_stops, 1u);
     CHECK_EQ(device.decoder_starts, 1u);
 
@@ -230,14 +245,14 @@ void test_timeout_drain_recovery()
     CHECK(session.sync(2, &index2) == StatefulSession::SyncStatus::ok);
     StatefulSession::Frame index3;
     CHECK(session.sync(3, &index3) == StatefulSession::SyncStatus::ok);
-    CHECK_EQ(session.timeout_recoveries(), 1u);
+    CHECK_EQ(session.idle_drains(), 1u);
 
     /* A drain that yields only an empty LAST buffer: decode error. */
     session.submit(4, fake_au());
     device.on_decoder_stop = [&device]() { device.deliver_empty_last(); };
     StatefulSession::Frame index4;
     CHECK(session.sync(4, &index4) == StatefulSession::SyncStatus::decode_error);
-    CHECK_EQ(session.timeout_recoveries(), 2u);
+    CHECK_EQ(session.idle_drains(), 2u);
 }
 
 void test_capture_pool_share()
@@ -377,6 +392,169 @@ void test_idle_drain_on_stream_tail()
     CHECK(session.sync(4, &frame) == StatefulSession::SyncStatus::ok);
     CHECK(session.sync(5, &frame) == StatefulSession::SyncStatus::ok);
     CHECK_EQ(session.idle_drains(), 1u);
+}
+
+void test_paced_client_is_not_end_of_stream()
+{
+    /* D85, THE defect this branch exists for. A paced streaming client --
+     * Firefox feeding an MSE SourceBuffer, any network-fed player -- routinely
+     * pauses between submits while a sync is outstanding, because the next
+     * access unit has not arrived yet. The pre-D85 backend read that pause as
+     * end of stream and issued DEC_CMD_STOP: the codec's reference chain went
+     * with it, the next non-IDR access unit decoded against nothing, and
+     * Firefox fell back to software (D91 7.3, P4-verify 4.5, twice each).
+     *
+     * So: a pause that is short of the quiet window must NOT drain, even when
+     * it runs well past the hard cap -- the hard cap is a cap on ONE sync, and
+     * a paced client legitimately needs longer than it to feed the access units
+     * the waiting frame depends on. on_decoder_stop here would rescue the sync
+     * if a drain fired, so the test cannot pass by accident.
+     *
+     * Named mutations this fails under: (1) put hard_expired back into the
+     * drain condition on the mid-stream path (`idle_expired || hard_expired ||
+     * stalled`) -- the client is drained at the 40 ms cap while feeding
+     * normally; (2) drop the submit_count_ reset of idle_since -- the quiet
+     * window never restarts and the 150 ms threshold fires mid-pace. */
+    FakeDevice device;
+    device.manual_delivery = true;
+    device.on_decoder_stop = [&device]() { device.deliver(1, /*last=*/true); };
+    StatefulSession::Options options;
+    options.num_surfaces = 6;
+    options.output_ring_size = 8;
+    options.sync_timeout_ms = 40; /* the pre-D85 trigger: below the client's own pace */
+    options.sync_idle_ms = 150; /* the quiet window, scaled down from 1000 ms */
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+    CHECK_EQ(session.midstream_stall_ms(), 450); /* max(40, 3 x 150) */
+
+    session.submit(1, fake_au());
+
+    /* The client's own pace: one access unit every 60 ms -- four times the hard
+     * cap, well inside the quiet window. The frame for sequence 1 comes out
+     * only after the codec has had them, which is exactly why the sync is
+     * still waiting. */
+    std::thread feeder([&] {
+        for (uint64_t sequence = 2; sequence <= 4; sequence++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            session.submit(sequence, fake_au());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        auto guard = session.hold(); /* serialise the fake against the harvester */
+        device.deliver(1);
+    });
+
+    StatefulSession::Frame frame;
+    const auto status = session.sync(1, &frame);
+    feeder.join();
+
+    CHECK(status == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(device.decoder_stops, 0u); /* the reference chain was never cut */
+    CHECK_EQ(device.decoder_starts, 0u);
+    CHECK_EQ(session.idle_drains(), 0u);
+    CHECK_EQ(session.timeout_recoveries(), 0u);
+    CHECK(!session.dead());
+}
+
+void test_backstop_drains_a_moving_pipeline()
+{
+    /* The other half of the D85 policy: the quiet window cannot be the only
+     * trigger, or a sync whose frame never comes while the pipeline keeps
+     * moving would wait for ever (the client's thread never returns). The
+     * backstop runs from the start of the sync and never restarts, and when it
+     * fires the event is a 'sync timeout' -- the 7.6 point 5b counter whose bar
+     * is 0 on every clip, so it must not be spent on an ordinary stream tail.
+     *
+     * Here input keeps arriving and frames keep coming back for OTHER
+     * sequences, so the quiet window never expires; only the backstop can end
+     * this sync. Named mutation this fails under: drop the `stalled` term from
+     * the drain condition -- the sync hangs and the test times out. */
+    FakeDevice device;
+    device.manual_delivery = true;
+    StatefulSession::Options options;
+    options.num_surfaces = 8;
+    options.output_ring_size = 8;
+    options.sync_timeout_ms = 50;
+    options.sync_idle_ms = 100; /* backstop = max(50, 300) = 300 ms */
+    StatefulSession session(device, 0x34363248, 1920, 1088, options);
+    CHECK_EQ(session.midstream_stall_ms(), 300);
+
+    session.submit(1, fake_au()); /* the frame the client waits for */
+    device.on_decoder_stop = [&device]() { device.deliver(1, /*last=*/true); };
+
+    std::atomic<bool> stop { false };
+    std::thread feeder([&] {
+        uint64_t sequence = 2;
+        while (!stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (stop.load()) {
+                break;
+            }
+            session.submit(sequence, fake_au());
+            {
+                auto guard = session.hold();
+                device.deliver(sequence); /* the device is busy -- just not with ours */
+            }
+            sequence += 1;
+        }
+    });
+
+    const auto before = std::chrono::steady_clock::now();
+    StatefulSession::Frame frame;
+    const auto status = session.sync(1, &frame);
+    const auto elapsed_ms
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
+    stop.store(true);
+    feeder.join();
+
+    CHECK(status == StatefulSession::SyncStatus::ok);
+    CHECK_EQ(session.timeout_recoveries(), 1u); /* the backstop, not the tail */
+    CHECK_EQ(session.idle_drains(), 0u);
+    CHECK(elapsed_ms >= 250); /* it waited out the backstop, not the 50 ms cap */
+    CHECK(elapsed_ms < 1500);
+}
+
+void test_drain_window_defaults()
+{
+    /* The shipped numbers, because they ARE the fix: a mid-stream drain costs
+     * the rest of the stream (the codec restarts with no references and every
+     * non-IDR access unit after it decodes against nothing), while waiting too
+     * long costs the last few frames of one stream a little latency, once. The
+     * two are not comparable, so the quiet window sits far above any pacing gap
+     * a live client plausibly has. Where no mid-stream drain can fire (AV1/VP9)
+     * the window triggers nothing and stays what it always was.
+     *
+     * Named mutation this fails under: resolve_sync_idle returning
+     * kDefaultSyncIdleMs whatever the codec (the pre-D85 50 ms). */
+    unsetenv("LIBVA_V4L2_SYNC_IDLE_MS");
+    unsetenv("LIBVA_V4L2_SYNC_TIMEOUT_MS");
+    {
+        FakeDevice device;
+        StatefulSession::Options options; /* H.264: allow_midstream_drain defaults true */
+        options.num_surfaces = 6;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        CHECK_EQ(session.sync_idle_ms(), 1000);
+        CHECK_EQ(session.sync_timeout_ms(), 500);
+        CHECK_EQ(session.midstream_stall_ms(), 3000);
+    }
+    {
+        FakeDevice device;
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        options.allow_midstream_drain = false; /* AV1/VP9 */
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        CHECK_EQ(session.sync_idle_ms(), 50);
+        CHECK_EQ(session.sync_timeout_ms(), 500);
+    }
+    /* Tunable for the field without a rebuild (the value the phone sweeps). */
+    setenv("LIBVA_V4L2_SYNC_IDLE_MS", "250", 1);
+    {
+        FakeDevice device;
+        StatefulSession::Options options;
+        options.num_surfaces = 6;
+        StatefulSession session(device, 0x34363248, 1920, 1088, options);
+        CHECK_EQ(session.sync_idle_ms(), 250);
+        CHECK_EQ(session.midstream_stall_ms(), 750);
+    }
+    unsetenv("LIBVA_V4L2_SYNC_IDLE_MS");
 }
 
 void test_reenterable_recovery()
@@ -746,10 +924,13 @@ int main()
     test_drop_sequence_recycles();
     test_capture_pool_share();
     test_stale_release_after_reprovision();
-    test_timeout_drain_recovery();
+    test_stalled_sync_drain_recovery();
     test_idle_drain_on_stream_tail();
     test_reenterable_recovery();
     test_midstream_drain_is_codec_aware();
+    test_paced_client_is_not_end_of_stream();
+    test_backstop_drains_a_moving_pipeline();
+    test_drain_window_defaults();
     test_provision_retry_on_ebusy();
     test_no_drain_before_source_change();
     test_output_ring_growth();
