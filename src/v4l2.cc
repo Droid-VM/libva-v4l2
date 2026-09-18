@@ -45,6 +45,7 @@ extern "C" {
 #include <libudev.h>
 }
 
+#include "device_scan.h"
 #include "utils.h"
 
 namespace {
@@ -185,6 +186,37 @@ bool is_stateful_decoder_node(int video_fd, v4l2_buf_type output_type)
     return dynamic_resolution && !slice_or_frame;
 }
 
+/* The udev-free fallback probes /dev/video0 .. /dev/video63: a bounded sweep
+ * of PATHS rather than a readdir, so it needs nothing but the right to open
+ * the node itself -- which is exactly what Firefox's RDD broker grants, node
+ * by node, for the M2M devices it found in the parent. 64 covers every DroidVM
+ * guest (three nodes: camera, decoder, encoder) with room for a host that
+ * renumbers them. */
+constexpr unsigned kFallbackScanNodes = 64;
+
+/* One node, opened read-only and non-blocking so a camera node cannot stall
+ * the probe, and closed again. nullopt when the node is absent, refused, or
+ * does not answer VIDIOC_QUERYCAP. */
+std::optional<device_scan::NodeProbe> probe_video_node(const std::string& path)
+{
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+
+    std::optional<device_scan::NodeProbe> result;
+    try {
+        const uint32_t capabilities = query_capabilities(fd);
+        const v4l2_buf_type output_type
+            = (capabilities & V4L2_CAP_VIDEO_M2M) ? V4L2_BUF_TYPE_VIDEO_OUTPUT : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        result = device_scan::NodeProbe { capabilities, is_stateful_decoder_node(fd, output_type) };
+    } catch (const std::exception&) {
+        /* Not a usable node; keep probing the others. */
+    }
+    close(fd);
+    return result;
+}
+
 } // namespace
 
 bool V4L2M2MDevice::stateful_decoder() const
@@ -196,59 +228,71 @@ std::vector<std::pair<std::string, std::optional<std::string>>> V4L2M2MDevice::e
 {
     std::vector<std::pair<std::string, std::optional<std::string>>> result;
 
+    /* udev_new() fails in a process with no /sys and no /run/udev; the walks
+     * below would then enumerate nothing anyway, so skip them rather than
+     * hand libudev a null context. */
     std::unique_ptr<udev, decltype(&udev_unref)> ctx(udev_new(), &udev_unref);
-    for (auto&& media_device : enumerate_media_devices(ctx.get())) {
-        for (auto&& video_device : enumerate_video_devices(ctx.get(), media_device)) {
-            int fd = errno_wrapper(open, video_device.c_str(), O_RDONLY);
-            if (query_capabilities(fd) & required_capabilities) {
-                result.emplace_back(video_device, media_device);
+    if (ctx) {
+        for (auto&& media_device : enumerate_media_devices(ctx.get())) {
+            for (auto&& video_device : enumerate_video_devices(ctx.get(), media_device)) {
+                int fd = errno_wrapper(open, video_device.c_str(), O_RDONLY);
+                if (query_capabilities(fd) & required_capabilities) {
+                    result.emplace_back(video_device, media_device);
+                }
+                close(fd);
             }
-            close(fd);
+        }
+
+        /* Stateful decoders (VPU_DESIGN.md 7.6 point 1) have no media controller
+         * node, so the media-driven walk above cannot find them: also probe the
+         * video4linux subsystem directly and keep M2M nodes whose coded formats
+         * mark them stateful. */
+        std::unique_ptr<udev_enumerate, decltype(&udev_enumerate_unref)> video_enumerate(
+            udev_enumerate_new(ctx.get()), &udev_enumerate_unref);
+        udev_enumerate_add_match_subsystem(video_enumerate.get(), "video4linux");
+        udev_enumerate_scan_devices(video_enumerate.get());
+
+        std::vector<std::string> udev_nodes;
+        for (auto entry = udev_enumerate_get_list_entry(video_enumerate.get()); entry != nullptr;
+             entry = udev_list_entry_get_next(entry)) {
+            std::unique_ptr<udev_device, decltype(&udev_device_unref)> device(
+                udev_device_new_from_syspath(ctx.get(), udev_list_entry_get_name(entry)), &udev_device_unref);
+            if (!device) {
+                continue;
+            }
+            const char* devname = udev_device_get_property_value(device.get(), "DEVNAME");
+            if (devname == nullptr) {
+                continue;
+            }
+            const std::string video_device(devname);
+            if (std::ranges::any_of(result, [&](auto&& r) { return r.first == video_device; })) {
+                continue;
+            }
+            udev_nodes.push_back(video_device);
+        }
+
+        for (auto&& video_device :
+            device_scan::select_decode_nodes(udev_nodes, required_capabilities, probe_video_node)) {
+            result.emplace_back(video_device, std::nullopt);
         }
     }
 
-    /* Stateful decoders (VPU_DESIGN.md 7.6 point 1) have no media controller
-     * node, so the media-driven walk above cannot find them: also probe the
-     * video4linux subsystem directly and keep M2M nodes whose coded formats
-     * mark them stateful. */
-    std::unique_ptr<udev_enumerate, decltype(&udev_enumerate_unref)> video_enumerate(
-        udev_enumerate_new(ctx.get()), &udev_enumerate_unref);
-    udev_enumerate_add_match_subsystem(video_enumerate.get(), "video4linux");
-    udev_enumerate_scan_devices(video_enumerate.get());
+    if (!result.empty()) {
+        return result;
+    }
 
-    for (auto entry = udev_enumerate_get_list_entry(video_enumerate.get()); entry != nullptr;
-         entry = udev_list_entry_get_next(entry)) {
-        std::unique_ptr<udev_device, decltype(&udev_device_unref)> device(
-            udev_device_new_from_syspath(ctx.get(), udev_list_entry_get_name(entry)), &udev_device_unref);
-        if (!device) {
-            continue;
-        }
-        const char* devname = udev_device_get_property_value(device.get(), "DEVNAME");
-        if (devname == nullptr) {
-            continue;
-        }
-        const std::string video_device(devname);
-        if (std::ranges::any_of(result, [&](auto&& r) { return r.first == video_device; })) {
-            continue;
-        }
-
-        int fd = open(video_device.c_str(), O_RDONLY);
-        if (fd < 0) {
-            continue;
-        }
-        try {
-            uint32_t capabilities = query_capabilities(fd);
-            if (capabilities & required_capabilities) {
-                v4l2_buf_type output_type = (capabilities & V4L2_CAP_VIDEO_M2M) ? V4L2_BUF_TYPE_VIDEO_OUTPUT
-                                                                                : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-                if (is_stateful_decoder_node(fd, output_type)) {
-                    result.emplace_back(video_device, std::nullopt);
-                }
-            }
-        } catch (const std::exception&) {
-            /* Not a usable node; keep probing the others. */
-        }
-        close(fd);
+    /* P-4 (E2E-vpu.md 11.1 layer 2): udev found nothing. In a normal session
+     * that means there is nothing to find; in Firefox's RDD (media) process it
+     * means the sandbox has no /sys and no /run/udev, while the decoder node
+     * itself IS reachable -- that process's file broker enumerates /dev/video*
+     * in the PARENT and grants the M2M ones by path
+     * (SandboxBrokerPolicyFactory::AddV4l2Dependencies, used only by
+     * GetRDDPolicy). So repeat the same capability + stateful-decoder test over
+     * a bounded sweep of node paths. Selection and order are the udev walk's,
+     * which is why both go through device_scan::select_decode_nodes. */
+    for (auto&& video_device : device_scan::select_decode_nodes(
+             device_scan::candidate_paths(kFallbackScanNodes), required_capabilities, probe_video_node)) {
+        result.emplace_back(video_device, std::nullopt);
     }
 
     return result;

@@ -60,6 +60,8 @@ public:
 
 private:
     void log(const char* message);
+    /* Names the sandbox wall behind a failed allocation (P-4 layer 3). */
+    void log_sandbox_wall();
 
     std::function<void(const char*)> log_;
     gbm_device* device_ = nullptr;

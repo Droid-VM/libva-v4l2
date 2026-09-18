@@ -44,6 +44,7 @@ sources = [
 	'format.cc',
 	'media.cc',
 	'v4l2.cc',
+	'device_scan.cc',
 	'mpeg2.cc',
 	'h264.cc',
 	'vp8.cc',
@@ -71,6 +72,7 @@ headers = [
 	'format.h',
 	'media.h',
 	'v4l2.h',
+	'device_scan.h',
 	'mpeg2.h',
 	'h264.h',
 	'vp8.h',
@@ -217,6 +219,16 @@ test_capture_index = executable('test_capture_index',
 	cpp_args: cpp_args,
 	dependencies: [ kernel_dep ])
 test('capture-index', test_capture_index)
+
+# P-4 (E2E-vpu.md 11.1 layer 2): the udev-free device scan. The pure
+# selection -- M2M capability word plus the stateful-decoder format test --
+# driven against a fake device list, so the fallback that Firefox's sandboxed
+# media process depends on is covered without a /dev.
+test_device_scan = executable('test_device_scan',
+	[ '../test/stateful/test_device_scan.cc', 'device_scan.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ kernel_dep ])
+test('device-scan', test_device_scan)
 
 dl_dep = cc.find_library('dl', required: false)
 

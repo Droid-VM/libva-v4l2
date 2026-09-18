@@ -173,6 +173,7 @@ std::unique_ptr<SurfaceBuffer> GbmAllocator::allocate(uint32_t width, uint32_t h
         bo = gbm_bo_create(device_, width, height + height / 2, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
         if (bo == nullptr) {
             log("gbm: gbm_bo_create(R8 container) failed -- MMAP fallback");
+            log_sandbox_wall();
             return nullptr;
         }
     }
@@ -191,6 +192,39 @@ std::unique_ptr<SurfaceBuffer> GbmAllocator::allocate(uint32_t width, uint32_t h
 
     stride_out = stride;
     return std::make_unique<GbmSurfaceBuffer>(bo, fd, stride, container);
+}
+
+/*
+ * P-4 layer 3 (E2E-vpu.md 11.1). One failed gbm_bo_create inside Firefox's RDD
+ * (media) process cost a whole WP to explain, so explain it here instead.
+ *
+ * The chain: Firefox's seccomp policy answers sysinfo(2) with EPERM in every
+ * child but the content one (SandboxPolicyCommon,
+ * security/sandbox/linux/SandboxFilter.cpp); glibc's sysconf(_SC_PHYS_PAGES)
+ * IS that syscall; Mesa's os_get_total_physical_memory() is that sysconf; and
+ * zink_screen.c refuses to create a screen when it fails. GBM then falls back
+ * to kms_swrast, whose winsys allocates with DRM_IOCTL_MODE_CREATE_DUMB -- an
+ * ioctl a DRM RENDER node rejects with EACCES by construction, because it is
+ * not DRM_RENDER_ALLOW. Hence "KMS: DRM_IOCTL_MODE_CREATE_DUMB failed:
+ * Permission denied" from a process that was handed a perfectly good render
+ * node.
+ *
+ * The test is a hint, not a proof: glibc does not check that sysinfo failed,
+ * so it returns uninitialised stack, which usually but not always reads as an
+ * error. A false negative costs nothing -- the MMAP fallback line above is
+ * printed either way.
+ */
+void GbmAllocator::log_sandbox_wall()
+{
+    if (sysconf(_SC_PHYS_PAGES) > 0) {
+        return;
+    }
+    log("gbm: this process cannot read the system memory size (sysconf(_SC_PHYS_PAGES) failed), so it is "
+        "sandboxed -- Firefox answers sysinfo(2) with EPERM outside the content process");
+    log("gbm: Mesa's zink screen refuses to start without that number and GBM degrades to kms_swrast, which "
+        "allocates with DRM_IOCTL_MODE_CREATE_DUMB -- an ioctl a DRM render node always refuses (EACCES)");
+    log("gbm: so zero-copy cannot work in this process until the guest Mesa carries the zink fix. Decoding "
+        "still works; vaExportSurfaceHandle will answer UNIMPLEMENTED and a browser falls back to software");
 }
 
 void GbmAllocator::log(const char* message)
