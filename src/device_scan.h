@@ -41,12 +41,16 @@
  * there, vaInitialize fails with "No usable V4L2 M2M decode device found",
  * and a shipped browser silently decodes in software.
  *
- * The fallback therefore must not list a directory either (opening /dev as a
- * directory is not in that policy): it probes a fixed, bounded set of node
- * PATHS with open()+VIDIOC_QUERYCAP, which is exactly what the broker is
- * prepared to answer. The selection below is the pure part -- the same
- * capability and stateful-decoder test the udev walk applies -- so it can be
- * driven from a unit test with a fake device list and no /dev at all.
+ * The fallback therefore probes a fixed, bounded set of node PATHS with
+ * open()+VIDIOC_QUERYCAP, which is exactly what that broker is prepared to
+ * answer. Listing /dev would in fact also be allowed -- the same function ends
+ * with AddPath(rdonly, "/dev"), "FFmpeg V4L2 needs to list /dev to find V4L2
+ * devices" -- but nothing here depends on that, which is the point: the sweep
+ * works in any process that can open the node at all, including one whose
+ * broker grants the node and nothing else. The selection below is the pure
+ * part -- the same capability and stateful-decoder test the udev walk applies
+ * -- so it can be driven from a unit test with a fake device list and no /dev
+ * at all.
  */
 namespace device_scan {
 

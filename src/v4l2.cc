@@ -186,11 +186,12 @@ bool is_stateful_decoder_node(int video_fd, v4l2_buf_type output_type)
     return dynamic_resolution && !slice_or_frame;
 }
 
-/* The udev-free fallback probes /dev/video0 .. /dev/video63. A bounded sweep
- * of PATHS, never a readdir of /dev: Firefox's RDD file broker answers for the
- * M2M nodes it granted by path and refuses everything else, and opening /dev
- * itself is not in that policy. 64 covers every DroidVM guest (three nodes:
- * camera, decoder, encoder) with room for a host that renumbers them. */
+/* The udev-free fallback probes /dev/video0 .. /dev/video63: a bounded sweep
+ * of PATHS rather than a readdir, so it needs nothing but the right to open
+ * the node itself -- which is exactly what Firefox's RDD broker grants, node
+ * by node, for the M2M devices it found in the parent. 64 covers every DroidVM
+ * guest (three nodes: camera, decoder, encoder) with room for a host that
+ * renumbers them. */
 constexpr unsigned kFallbackScanNodes = 64;
 
 /* One node, opened read-only and non-blocking so a camera node cannot stall
