@@ -160,7 +160,15 @@ void test_round_trip_high_1080p(GstH264NalParser* parser)
     /* The reorder deadlock rule (7.6 points 3/5a). */
     CHECK_EQ(parsed.sps.vui_parameters_present_flag, 1);
     CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
-    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 4u);
+    /* D91: the decoder may not sit on ANY picture before its first output on
+     * this transport -- the CAPTURE buffer is claimed by the sequence stamped
+     * on the input, so output order carries no information and only latency
+     * costs. num_ref_frames (4 here) is the pre-D91 value and the whole
+     * defect: it made c2.qti.avc.decoder wait for a 5th access unit while
+     * Firefox fed 3 and blocked. */
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 0u);
+    /* References are untouched: the full DPB is still declared. */
+    CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 4u);
     CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 4u);
     CHECK_EQ(parsed.sps.vui_parameters.motion_vectors_over_pic_boundaries_flag, 1);
 
@@ -192,7 +200,8 @@ void test_round_trip_main_720p(GstH264NalParser* parser)
     CHECK_EQ(parsed.sps.width, 1280); /* no cropping: coded == displayed */
     CHECK_EQ(parsed.sps.height, 720);
     CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
-    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 2u);
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 0u);
+    CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 2u);
 
     CHECK_EQ(parsed.pps.id, 5); /* the pps_id the slices reference */
     CHECK_EQ(parsed.pps.weighted_pred_flag, 1);
@@ -302,6 +311,37 @@ unsigned count_nal_types(const std::vector<uint8_t>& access_unit, uint8_t type)
     return count;
 }
 
+/*
+ * D91. The synthesised VUI must never let the decoder sit on a picture before
+ * its first output, whatever the stream's reference count: that number is the
+ * codec's announce threshold, and a browser that feeds 3 access units and then
+ * blocks on vaSyncSurface never reaches it. The mutation this pins -- writing
+ * num_ref_frames, which is what the pre-D91 code did -- stalls the D91
+ * adaptive High stream on the phone.
+ */
+void test_reorder_depth_is_zero_whatever_the_dpb(GstH264NalParser* parser)
+{
+    for (unsigned refs : { 1u, 2u, 4u, 5u, 16u }) {
+        auto picture = high_1080p_picture();
+        picture.num_ref_frames = static_cast<uint8_t>(refs);
+        auto sets = synthesize_parameter_sets(picture, nullptr, VAProfileH264High, 1920, 1080, 0, 1, 0);
+        auto parsed = parse_back(parser, write_parameter_sets(sets));
+        CHECK_EQ(parsed.sps.num_ref_frames, refs);
+        CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
+        CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 0u);
+        /* The retention bound must still follow the DPB, or references die. */
+        CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, refs);
+    }
+
+    /* Constrained Baseline, the profile that always worked, must not move. */
+    auto baseline = main_720p_picture();
+    baseline.num_ref_frames = 1;
+    auto sets = synthesize_parameter_sets(baseline, nullptr, VAProfileH264ConstrainedBaseline, 1280, 720, 0, 0, 0);
+    auto parsed = parse_back(parser, write_parameter_sets(sets));
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 0u);
+    CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 1u);
+}
+
 void test_access_unit_assembly()
 {
     H264AccessUnitBuilder builder(VAProfileH264High);
@@ -357,6 +397,7 @@ int main()
     test_round_trip_main_720p(parser);
     test_round_trip_scaling_lists(parser);
     test_slice_header_parsing();
+    test_reorder_depth_is_zero_whatever_the_dpb(parser);
     test_access_unit_assembly();
 
     gst_h264_nal_parser_free(parser);

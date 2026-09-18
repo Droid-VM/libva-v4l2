@@ -312,7 +312,46 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
 
     /* The reorder deadlock rule (7.6 points 3 and 5a): a VA client takes
      * frames in display order and stops feeding input while it waits, so the
-     * decoder must not hold back more frames than the DPB implies. */
+     * decoder must not hold back more frames than the DPB implies.
+     *
+     * D91 is this one field. max_num_reorder_frames is how many pictures the
+     * decoder is ALLOWED to sit on before its first output, and a decoder that
+     * is allowed to sit on N produces nothing until access unit N + 1 (plus
+     * its own pipeline). VA carries no reorder depth, so num_ref_frames was
+     * used as a stand-in -- a safe upper bound that is, on real streams,
+     * enormous. The adaptive High stream in the D91 record declares 5
+     * reference frames against a true reorder depth of 2, so we told
+     * c2.qti.avc.decoder it could hold 5 and it duly waited for the 6th access
+     * unit: exactly the "the codec needs ~6 High-profile pictures before
+     * SOURCE_CHANGE" threshold B26 measured and B23-B29 spent six rounds
+     * attributing to Qualcomm. Firefox feeds 3 and blocks on vaSyncSurface, so
+     * the grace expired, the sequence-1 sync failed, vaExportSurfaceHandle
+     * failed, and it fell back to software. Constrained Baseline escaped only
+     * because num_ref_frames is 1 there.
+     *
+     * 0 is the right value HERE, and it is a statement about this transport
+     * rather than about the content. Output ORDER carries no information on
+     * this path: every access unit is queued with its sequence as the V4L2
+     * timestamp and the CAPTURE buffer is claimed by that tag (session.cc), so
+     * the client is handed the picture it submitted whatever order the decoder
+     * emits in -- and a VA client always reorders for itself, out of the DPB
+     * it owns and whose POCs it has just handed us. What the client cannot
+     * absorb is output LATENCY, because it blocks on the picture it has just
+     * submitted. So ask the decoder to bump each picture as soon as it is
+     * decoded.
+     *
+     * Measured, not assumed, on the phone. Sub-threshold browser-free repro
+     * (B28's `-flags low_delay`: a 3-access-unit feeder, the Firefox shape) --
+     * declared 0 or 1 gets past the first sync, declared 2, 3 or 5 stalls at 3
+     * fed / 0 out. Full decode of the same fixture -- declared 0 gives
+     * byte-identical output to declared 2, 3 and 5. Host-direct MediaCodec
+     * probe against c2.qti.avc.decoder -- declared 0 delivers 300/300 in the
+     * same delivery order as the native stream, so the decoder neither drops
+     * pictures nor reorders differently; it only starts sooner.
+     *
+     * max_dec_frame_buffering is deliberately left at the full DPB: it governs
+     * what may be RETAINED, which references depend on, not how long output
+     * may be withheld. */
     sps.vui_parameters_present_flag = 1;
     GstH264VUIParams& vui = sps.vui_parameters;
     vui.bitstream_restriction_flag = 1;
@@ -321,7 +360,7 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
     vui.max_bits_per_mb_denom = 1;
     vui.log2_max_mv_length_horizontal = 15;
     vui.log2_max_mv_length_vertical = 15;
-    vui.num_reorder_frames = picture.num_ref_frames;
+    vui.num_reorder_frames = 0;
     vui.max_dec_frame_buffering = std::max<uint32_t>(picture.num_ref_frames, 1u);
 
     pps.id = static_cast<gint>(pps_id);

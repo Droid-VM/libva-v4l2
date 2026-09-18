@@ -736,6 +736,20 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
             }
         }
     }
+    /* The same diagnostic for H.264 (env LIBVA_V4L2_H264_DUMP): the file is an
+     * Annex-B elementary stream of exactly the bytes, in order, that this
+     * session queues on OUTPUT, so `ffmpeg -err_detect aggressive+explode -c:v
+     * h264 -i dump.h264 -f null -` is an off-device validity gate for the
+     * re-synthesised SPS/PPS (D91). Scoped to H.264 sessions for the reason
+     * above: submit() is shared by every codec. */
+    if (output_pixelformat_ == V4L2_PIX_FMT_H264) {
+        if (const char* dump = getenv("LIBVA_V4L2_H264_DUMP")) {
+            if (FILE* fp = fopen(dump, "ab")) {
+                fwrite(access_unit.data(), 1, access_unit.size(), fp);
+                fclose(fp);
+            }
+        }
+    }
     if (access_unit.empty()) {
         throw std::invalid_argument("empty access unit");
     }
