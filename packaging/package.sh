@@ -4,10 +4,11 @@
 #   package.sh <version> <stagedir> <outdir> <driverdir>
 #
 # Called by build-in-container.sh once the cross build is done, so the payload and the
-# environment it ships are described in exactly one place. Two files go in:
+# environment it ships are described in exactly one place. Three things go in:
 #
 #   <driverdir>/v4l2_drv_video.so    the backend libva dlopen()s
 #   /etc/profile.d/droidvm-va.sh     the environment that makes libva pick it
+#   .../defaults/pref/droidvm-vaapi.js  the Firefox default that makes it ASK for hardware
 #
 # WHY THE ENVIRONMENT IS PART OF THE PACKAGE (design VPU_DESIGN.md 7.6 point 1)
 #
@@ -75,6 +76,65 @@ EOF
 chmod 0644 "$root/etc/profile.d/droidvm-va.sh"
 
 # ---------------------------------------------------------------------------
+# THE FIREFOX DEFAULT (P-4 layer 1, E2E-vpu.md 11.1)
+#
+# A stock firefox-esr launched from the guest's desktop menu decoded every
+# video in SOFTWARE while the hardware decoder sat idle, and nothing on screen
+# said so -- about:support reported "Hardware Decoding: Supported" for H264,
+# VP9, AV1 and HEVC the whole time, and playback was smooth because four ARM
+# cores can carry 1080p. The phone's device ledger was the only witness: not
+# one codec session for the entire playback.
+#
+# The reason is upstream policy, not a bug: Firefox only ATTEMPTS VA-API on a
+# driver its own allowlist recognises, and a backend that is not Mesa/Intel/AMD
+# is not on that list. `media.hardware-video-decoding.force-enabled` is the
+# documented escape hatch, and it defaults to false. So the backend is never
+# even asked.
+#
+# This is shipped rather than documented for the same reason
+# LIBVA_DRIVER_NAME=v4l2 is: "set this or nothing works" is not a tuning knob.
+# It is a DEFAULT pref, not a lock -- about:config still wins -- and it does
+# NOT weaken the sandbox in any way; the sandbox is a separate problem that no
+# pref should be used to solve.
+#
+# WHY THIS PATH. Mozilla's own .deb (packages.mozilla.org, the repo the guest
+# uses -- not the Ubuntu snap) installs to /usr/lib/firefox-esr and already
+# ships pref() defaults exactly here: firefox-esr 153.3.0esr~build1 arm64
+# carries defaults/pref/channel-prefs.js and defaults/pref/package-prefs.js
+# (the latter sets dom.ipc.forkserver.enable), verified by unpacking that .deb
+# [V]. So the mechanism is the vendor's own, not a guess. The file name is
+# ours, so no dpkg path collides and a firefox-esr upgrade leaves it alone.
+#
+# Both channel directories get a copy: the ESR deb is what the guest image
+# uses, /usr/lib/firefox is the rapid-release deb from the same repo. Ubuntu's
+# own `firefox` is a SNAP and cannot be reached this way at all -- a snap reads
+# neither this file nor /etc/profile.d/droidvm-va.sh, so the backend is not
+# usable from it and that is a packaging limitation, not a configuration one.
+# ---------------------------------------------------------------------------
+for ffdir in /usr/lib/firefox-esr /usr/lib/firefox; do
+    install -d -m 0755 "$root$ffdir/defaults/pref"
+    cat > "$root$ffdir/defaults/pref/droidvm-vaapi.js" <<'EOF'
+// Installed by libva-v4l2 (DroidVM guest VA-API backend).
+//
+// Firefox only attempts VA-API on a driver its own allowlist recognises. This
+// backend is not on that list, so without this line Firefox never calls
+// vaInitialize: every video decodes in software while DroidVM's hardware
+// decoder sits idle, and about:support still claims "Hardware Decoding:
+// Supported" (it reports what the platform could do, not what was tried).
+//
+// A default, not a lock: about:config overrides it. It does not disable or
+// weaken any sandbox.
+pref("media.hardware-video-decoding.force-enabled", true);
+
+// The VA-API decode module itself. Already true on Linux in current builds;
+// stated so a build that ships it off does not silently turn the backend into
+// dead weight.
+pref("media.ffmpeg.vaapi.enabled", true);
+EOF
+    chmod 0644 "$root$ffdir/defaults/pref/droidvm-vaapi.js"
+done
+
+# ---------------------------------------------------------------------------
 # Depends, derived from what the binary actually links against rather than typed out. Each
 # DT_NEEDED soname is resolved to the arm64 package that owns it in THIS image -- the same
 # Ubuntu release the guest runs -- so the list cannot drift from the build, and a new dependency
@@ -139,6 +199,13 @@ Description: VA-API backend for DroidVM's virtio-media V4L2 decoder
  virtio_gpu, which in this guest is Mesa's virgl video driver and decodes
  nothing) plus GST_VA_ALL_DRIVERS=1 and GST_VAAPI_ALL_DRIVERS=1, the vendor
  whitelist overrides GStreamer's two VA-API plugins each read separately.
+ .
+ Also installs defaults/pref/droidvm-vaapi.js into the Mozilla firefox-esr and
+ firefox .deb directories, setting
+ media.hardware-video-decoding.force-enabled -- Firefox otherwise never
+ attempts VA-API on a driver outside its own allowlist, and decodes in
+ software without saying so. It is a default pref, not a lock, and it changes
+ nothing about the browser's sandbox.
 EOF
 
 deb="${PKG}_${PKGVER}_arm64.deb"
