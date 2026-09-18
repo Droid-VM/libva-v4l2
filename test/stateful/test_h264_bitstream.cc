@@ -85,6 +85,20 @@ ParsedSets parse_back(GstH264NalParser* parser, std::vector<uint8_t> stream)
     return parsed;
 }
 
+/* The [SPS][PPS] prefix of an assembled access unit, for parse_back(). */
+std::vector<uint8_t> parameter_set_prefix(const std::vector<uint8_t>& access_unit)
+{
+    auto nals = split_nals(access_unit);
+    REQUIRE(nals.size() >= 3);
+    std::vector<uint8_t> prefix;
+    for (unsigned i = 0; i < 2; i++) {
+        const uint8_t start_code[] = { 0x00, 0x00, 0x00, 0x01 };
+        prefix.insert(prefix.end(), std::begin(start_code), std::end(start_code));
+        prefix.insert(prefix.end(), nals[i].begin(), nals[i].end());
+    }
+    return prefix;
+}
+
 VAPictureParameterBufferH264 high_1080p_picture()
 {
     /* A High-profile 1080p stream with B-frames, CABAC, 8x8 transform,
@@ -131,7 +145,7 @@ VAPictureParameterBufferH264 main_720p_picture()
 void test_round_trip_high_1080p(GstH264NalParser* parser)
 {
     auto picture = high_1080p_picture();
-    auto sets = synthesize_parameter_sets(picture, nullptr, VAProfileH264High, 1920, 1080, 0, 1, 0);
+    auto sets = synthesize_parameter_sets(picture, nullptr, VAProfileH264High, 1920, 1080, 0, 1, 0, 2);
     auto parsed = parse_back(parser, write_parameter_sets(sets));
 
     CHECK_EQ(parsed.sps.profile_idc, 100);
@@ -160,7 +174,9 @@ void test_round_trip_high_1080p(GstH264NalParser* parser)
     /* The reorder deadlock rule (7.6 points 3/5a). */
     CHECK_EQ(parsed.sps.vui_parameters_present_flag, 1);
     CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
-    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 4u);
+    /* D91: the reorder depth is what the caller observed, NOT num_ref_frames
+     * (4 here); max_dec_frame_buffering still carries the whole DPB. */
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 2u);
     CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 4u);
     CHECK_EQ(parsed.sps.vui_parameters.motion_vectors_over_pic_boundaries_flag, 1);
 
@@ -181,7 +197,7 @@ void test_round_trip_high_1080p(GstH264NalParser* parser)
 void test_round_trip_main_720p(GstH264NalParser* parser)
 {
     auto picture = main_720p_picture();
-    auto sets = synthesize_parameter_sets(picture, nullptr, VAProfileH264Main, 1280, 720, 5, 0, 0);
+    auto sets = synthesize_parameter_sets(picture, nullptr, VAProfileH264Main, 1280, 720, 5, 0, 0, 1);
     auto parsed = parse_back(parser, write_parameter_sets(sets));
 
     CHECK_EQ(parsed.sps.profile_idc, 77);
@@ -192,7 +208,8 @@ void test_round_trip_main_720p(GstH264NalParser* parser)
     CHECK_EQ(parsed.sps.width, 1280); /* no cropping: coded == displayed */
     CHECK_EQ(parsed.sps.height, 720);
     CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
-    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 2u);
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 1u);
+    CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 2u);
 
     CHECK_EQ(parsed.pps.id, 5); /* the pps_id the slices reference */
     CHECK_EQ(parsed.pps.weighted_pred_flag, 1);
@@ -217,7 +234,7 @@ void test_round_trip_scaling_lists(GstH264NalParser* parser)
         }
     }
 
-    auto sets = synthesize_parameter_sets(picture, &iq_matrix, VAProfileH264High, 1920, 1080, 0, 1, 0);
+    auto sets = synthesize_parameter_sets(picture, &iq_matrix, VAProfileH264High, 1920, 1080, 0, 1, 0, 2);
     auto parsed = parse_back(parser, write_parameter_sets(sets));
 
     CHECK_EQ(parsed.sps.scaling_matrix_present_flag, 1);
@@ -288,7 +305,15 @@ void run_picture(H264AccessUnitBuilder& builder, const VAPictureParameterBufferH
     }
     builder.add_slice_parameters(params);
     builder.add_slice_data(data);
-    *access_unit = builder.finish(1920, 1080);
+    auto finished = builder.finish(1920, 1080);
+    REQUIRE(finished.had_picture);
+    /* D91: the first picture is held until a client sync reveals the reorder
+     * depth. These cases model a client that syncs after one picture. */
+    if (finished.access_units.empty()) {
+        finished.access_units = builder.flush_held(0);
+    }
+    REQUIRE(finished.access_units.size() == 1);
+    *access_unit = finished.access_units[0];
 }
 
 unsigned count_nal_types(const std::vector<uint8_t>& access_unit, uint8_t type)
@@ -341,9 +366,100 @@ void test_access_unit_assembly()
     CHECK_EQ(count_nal_types(access_unit, 7), 1u);
     CHECK_EQ(count_nal_types(access_unit, 8), 1u);
 
-    /* No slices: empty access unit. */
+    /* No slices: nothing to assemble. */
     builder.set_picture_parameters(picture);
-    CHECK(builder.finish(1920, 1080).empty());
+    CHECK(!builder.finish(1920, 1080).had_picture);
+}
+
+/*
+ * D91. The VUI's max_num_reorder_frames is how many pictures the decoder may
+ * hold before its first output; VA does not carry it, and the pre-D91 stand-in
+ * num_ref_frames made c2.qti.avc.decoder sit on 6 High-profile access units
+ * while Firefox fed 3 and blocked. The builder must instead hold its access
+ * units until the client's first sync and then write the depth that sync
+ * revealed.
+ */
+void test_reorder_depth_comes_from_the_client_feed(GstH264NalParser* parser)
+{
+    H264AccessUnitBuilder builder(VAProfileH264High);
+    auto picture = high_1080p_picture();
+    picture.num_ref_frames = 5; /* the D91 stream: 5 refs, real reorder depth 2 */
+
+    /* Three pictures fed with no sync in between: all held, nothing emitted. */
+    for (unsigned i = 0; i < 3; i++) {
+        builder.set_picture_parameters(picture);
+        auto nal = fake_slice_nal(i == 0, static_cast<uint8_t>(0x20 + i));
+        VASliceParameterBufferH264 slice = {};
+        slice.slice_data_offset = 0;
+        slice.slice_data_size = nal.size();
+        builder.add_slice_parameters({ &slice, 1 });
+        builder.add_slice_data(nal);
+        auto finished = builder.finish(1920, 1080);
+        REQUIRE(finished.had_picture);
+        CHECK(finished.access_units.empty());
+        CHECK_EQ(builder.held_count(), i + 1u);
+    }
+
+    /* The client syncs: it fed 3, so its reorder depth is 2. */
+    auto access_units = builder.flush_held(static_cast<unsigned>(builder.held_count() - 1));
+    REQUIRE(access_units.size() == 3);
+    CHECK_EQ(builder.held_count(), 0u);
+
+    auto parsed = parse_back(parser, parameter_set_prefix(access_units[0]));
+    CHECK_EQ(parsed.sps.vui_parameters.bitstream_restriction_flag, 1);
+    /* The mutation this pins: writing num_ref_frames (5) here is exactly the
+     * D91 defect -- the codec then wants 6 access units before its first
+     * output and a 3-deep client never gets a frame. */
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 2u);
+    /* References are unaffected: the full DPB is still declared. */
+    CHECK_EQ(parsed.sps.vui_parameters.max_dec_frame_buffering, 5u);
+    CHECK_EQ(parsed.sps.num_ref_frames, 5u);
+
+    /* Only the first held access unit carries the parameter sets; the other
+     * two are slices only, and the slice payloads kept their order. */
+    CHECK_EQ(count_nal_types(access_units[0], 7), 1u);
+    CHECK_EQ(count_nal_types(access_units[1], 7), 0u);
+    CHECK_EQ(count_nal_types(access_units[2], 7), 0u);
+    CHECK_EQ(split_nals(access_units[1])[0][2], 0x21);
+    CHECK_EQ(split_nals(access_units[2])[0][2], 0x22);
+
+    /* From here nothing is held: the depth is known. */
+    std::vector<uint8_t> access_unit;
+    run_picture(builder, picture, false, 1, &access_unit);
+    CHECK_EQ(builder.held_count(), 0u);
+    CHECK_EQ(count_nal_types(access_unit, 1), 1u);
+}
+
+/*
+ * A client that keeps feeding without ever syncing is not waiting on us and
+ * cannot deadlock. The hold must not grow without bound: at the cap it is
+ * released with the conservative num_ref_frames, which is what the pre-D91
+ * code always wrote.
+ */
+void test_hold_is_capped_for_a_feed_ahead_client(GstH264NalParser* parser)
+{
+    H264AccessUnitBuilder builder(VAProfileH264High);
+    auto picture = high_1080p_picture();
+    picture.num_ref_frames = 5;
+
+    std::vector<std::vector<uint8_t>> released;
+    for (size_t i = 0; i < H264AccessUnitBuilder::kMaxHeldAccessUnits; i++) {
+        builder.set_picture_parameters(picture);
+        auto nal = fake_slice_nal(i == 0, 0x30);
+        VASliceParameterBufferH264 slice = {};
+        slice.slice_data_offset = 0;
+        slice.slice_data_size = nal.size();
+        builder.add_slice_parameters({ &slice, 1 });
+        builder.add_slice_data(nal);
+        auto finished = builder.finish(1920, 1080);
+        REQUIRE(finished.had_picture);
+        released = std::move(finished.access_units);
+    }
+    REQUIRE(released.size() == H264AccessUnitBuilder::kMaxHeldAccessUnits);
+    CHECK_EQ(builder.held_count(), 0u);
+
+    auto parsed = parse_back(parser, parameter_set_prefix(released[0]));
+    CHECK_EQ(parsed.sps.vui_parameters.num_reorder_frames, 5u);
 }
 
 } // namespace
@@ -358,6 +474,8 @@ int main()
     test_round_trip_scaling_lists(parser);
     test_slice_header_parsing();
     test_access_unit_assembly();
+    test_reorder_depth_comes_from_the_client_feed(parser);
+    test_hold_is_capped_for_a_feed_ahead_client(parser);
 
     gst_h264_nal_parser_free(parser);
     return check_result("test_h264_bitstream");

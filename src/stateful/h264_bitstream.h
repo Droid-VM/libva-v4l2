@@ -69,7 +69,8 @@ struct H264ParameterSets {
  */
 H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& picture,
     const VAIQMatrixBufferH264* iq_matrix, VAProfile profile, unsigned display_width, unsigned display_height,
-    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1);
+    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1,
+    unsigned max_num_reorder_frames);
 
 /* Serialize [startcode SPS][startcode PPS] with emulation prevention bytes. */
 std::vector<uint8_t> write_parameter_sets(const H264ParameterSets& sets);
@@ -78,9 +79,33 @@ std::vector<uint8_t> write_parameter_sets(const H264ParameterSets& sets);
  * Accumulates one picture's VA buffers and assembles the access unit.
  * SPS/PPS are re-emitted only when the derived parameter sets change, and
  * always before an IDR (7.6 point 3).
+ *
+ * D91: the VUI's max_num_reorder_frames -- how many pictures the decoder may
+ * hold before its first output -- is not carried by VA, and it decides whether
+ * a browser ever sees a frame (see the .cc). The client states it implicitly:
+ * a VA client submits exactly (reorder depth + 1) pictures before it blocks on
+ * its first vaSyncSurface, because that is when its own reordering hands out a
+ * frame. So the first access units are HELD until that first sync tells us the
+ * number, and only then serialised, headed by parameter sets carrying the
+ * observed value. A client that keeps feeding past kMaxHeldAccessUnits is not
+ * waiting on us at all; it gets the conservative num_ref_frames and no hold.
  */
 class H264AccessUnitBuilder {
 public:
+    /* Access units held while the client's reorder depth is still unknown. A
+     * client that feeds this many without syncing is feeding ahead and cannot
+     * deadlock, so the hold is dropped rather than grown. Above any real H.264
+     * reorder depth (the DPB itself caps at 16 frames). */
+    static constexpr size_t kMaxHeldAccessUnits = 16;
+
+    struct FinishResult {
+        /* False only when vaEndPicture arrived with no picture parameters or
+         * no slices -- the caller's invalid-parameter case. */
+        bool had_picture = false;
+        /* Ready to submit, oldest first; empty while the picture is held. */
+        std::vector<std::vector<uint8_t>> access_units;
+    };
+
     explicit H264AccessUnitBuilder(VAProfile profile);
 
     void set_picture_parameters(const VAPictureParameterBufferH264& picture);
@@ -92,8 +117,20 @@ public:
     void add_slice_data(std::span<const uint8_t> data);
 
     /* Assemble the access unit for vaEndPicture and reset the per-picture
-     * state. Empty when no slice was queued. */
-    std::vector<uint8_t> finish(unsigned display_width, unsigned display_height);
+     * state. */
+    FinishResult finish(unsigned display_width, unsigned display_height);
+
+    /* Access units assembled but not yet serialised, waiting for the client to
+     * reveal its reorder depth. */
+    size_t held_count() const { return held_.size(); }
+
+    /*
+     * Serialise and release every held access unit. max_num_reorder_frames is
+     * the value observed from the client (held_count() - 1 at its first sync);
+     * std::nullopt falls back to the conservative num_ref_frames. Every access
+     * unit that follows uses the same value without being held.
+     */
+    std::vector<std::vector<uint8_t>> flush_held(std::optional<unsigned> max_num_reorder_frames);
 
     bool has_picture() const { return has_picture_; }
 
@@ -109,6 +146,19 @@ private:
     uint8_t first_num_ref_idx_l0_ = 0;
     uint8_t first_num_ref_idx_l1_ = 0;
     std::vector<uint8_t> last_emitted_parameter_sets_;
+
+    /* One assembled but not yet serialised access unit: the parameter sets are
+     * complete except for max_num_reorder_frames, which flush_held() fills in. */
+    struct HeldAccessUnit {
+        H264ParameterSets sets;
+        bool idr = false;
+        std::vector<uint8_t> slices;
+    };
+    std::vector<HeldAccessUnit> held_;
+    std::optional<unsigned> max_num_reorder_frames_;
+    uint8_t last_num_ref_frames_ = 0;
+
+    std::vector<uint8_t> serialize(HeldAccessUnit& unit, unsigned max_num_reorder_frames);
 };
 
 } // namespace stateful

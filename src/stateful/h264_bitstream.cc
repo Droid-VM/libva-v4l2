@@ -220,7 +220,8 @@ std::optional<H264SliceHeaderInfo> parse_slice_header_info(std::span<const uint8
 
 H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& picture,
     const VAIQMatrixBufferH264* iq_matrix, VAProfile profile, unsigned display_width, unsigned display_height,
-    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1)
+    uint32_t pps_id, uint8_t num_ref_idx_l0_default_active_minus1, uint8_t num_ref_idx_l1_default_active_minus1,
+    unsigned max_num_reorder_frames)
 {
     H264ParameterSets sets = {};
     GstH264SPS& sps = sets.sps;
@@ -312,7 +313,22 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
 
     /* The reorder deadlock rule (7.6 points 3 and 5a): a VA client takes
      * frames in display order and stops feeding input while it waits, so the
-     * decoder must not hold back more frames than the DPB implies. */
+     * decoder must not hold back more frames than the DPB implies.
+     *
+     * D91: max_num_reorder_frames is exactly how many pictures the decoder is
+     * allowed to hold before its first output, and it is the whole of D91.
+     * num_ref_frames was used as a stand-in and it is an upper bound that is
+     * normally far too large: the adaptive High stream has 5 reference frames
+     * and a real reorder depth of 2, so we told the codec it could hold 5 and
+     * it duly consumed 6 access units before its first output -- precisely the
+     * "c2.qti.avc.decoder needs ~6 High-profile pictures before SOURCE_CHANGE"
+     * threshold B26 measured, and twice the ~3 access units a browser feeds
+     * before its first blocking vaSyncSurface. The threshold was ours.
+     *
+     * The caller passes the observed value instead (H264AccessUnitBuilder).
+     * max_dec_frame_buffering stays at the full DPB: it governs how many
+     * pictures may be RETAINED, which references depend on, not how long the
+     * decoder may sit on them before output. */
     sps.vui_parameters_present_flag = 1;
     GstH264VUIParams& vui = sps.vui_parameters;
     vui.bitstream_restriction_flag = 1;
@@ -321,8 +337,8 @@ H264ParameterSets synthesize_parameter_sets(const VAPictureParameterBufferH264& 
     vui.max_bits_per_mb_denom = 1;
     vui.log2_max_mv_length_horizontal = 15;
     vui.log2_max_mv_length_vertical = 15;
-    vui.num_reorder_frames = picture.num_ref_frames;
     vui.max_dec_frame_buffering = std::max<uint32_t>(picture.num_ref_frames, 1u);
+    vui.num_reorder_frames = std::min<uint32_t>(max_num_reorder_frames, vui.max_dec_frame_buffering);
 
     pps.id = static_cast<gint>(pps_id);
     pps.sequence = &sps;
@@ -417,34 +433,74 @@ void H264AccessUnitBuilder::add_slice_data(std::span<const uint8_t> data)
     pending_slice_params_.clear();
 }
 
-std::vector<uint8_t> H264AccessUnitBuilder::finish(unsigned display_width, unsigned display_height)
+std::vector<uint8_t> H264AccessUnitBuilder::serialize(HeldAccessUnit& unit, unsigned max_num_reorder_frames)
 {
+    unit.sets.sps.vui_parameters.num_reorder_frames
+        = std::min<uint32_t>(max_num_reorder_frames, unit.sets.sps.vui_parameters.max_dec_frame_buffering);
+
+    auto parameter_bytes = write_parameter_sets(unit.sets);
     std::vector<uint8_t> access_unit;
+    if (unit.idr || parameter_bytes != last_emitted_parameter_sets_) {
+        access_unit = parameter_bytes;
+        last_emitted_parameter_sets_ = std::move(parameter_bytes);
+    }
+    access_unit.insert(access_unit.end(), unit.slices.begin(), unit.slices.end());
+    return access_unit;
+}
+
+std::vector<std::vector<uint8_t>> H264AccessUnitBuilder::flush_held(std::optional<unsigned> max_num_reorder_frames)
+{
+    /* Without an observation fall back to the conservative upper bound the
+     * pre-D91 code always used. */
+    max_num_reorder_frames_ = max_num_reorder_frames.value_or(last_num_ref_frames_);
+
+    std::vector<std::vector<uint8_t>> access_units;
+    access_units.reserve(held_.size());
+    for (auto& unit : held_) {
+        access_units.push_back(serialize(unit, *max_num_reorder_frames_));
+    }
+    held_.clear();
+    return access_units;
+}
+
+H264AccessUnitBuilder::FinishResult H264AccessUnitBuilder::finish(unsigned display_width, unsigned display_height)
+{
+    FinishResult result;
 
     if (!has_picture_ || slice_bytes_.empty() || !first_slice_) {
         pending_slice_params_.clear();
         slice_bytes_.clear();
         first_slice_.reset();
-        return access_unit;
+        return result;
     }
+    result.had_picture = true;
 
-    auto sets = synthesize_parameter_sets(picture_, has_iq_matrix_ ? &iq_matrix_ : nullptr, profile_, display_width,
-        display_height, first_slice_->pps_id, first_num_ref_idx_l0_, first_num_ref_idx_l1_);
-    auto parameter_bytes = write_parameter_sets(sets);
-
-    const bool idr = first_slice_->nal_unit_type == 5 /* GST_H264_NAL_SLICE_IDR */;
-    if (idr || parameter_bytes != last_emitted_parameter_sets_) {
-        access_unit = parameter_bytes;
-        last_emitted_parameter_sets_ = std::move(parameter_bytes);
-    }
-    access_unit.insert(access_unit.end(), slice_bytes_.begin(), slice_bytes_.end());
+    HeldAccessUnit unit;
+    unit.sets = synthesize_parameter_sets(picture_, has_iq_matrix_ ? &iq_matrix_ : nullptr, profile_, display_width,
+        display_height, first_slice_->pps_id, first_num_ref_idx_l0_, first_num_ref_idx_l1_,
+        /* filled in by serialize() */ 0);
+    unit.idr = first_slice_->nal_unit_type == 5 /* GST_H264_NAL_SLICE_IDR */;
+    unit.slices = std::move(slice_bytes_);
 
     has_picture_ = false;
+    last_num_ref_frames_ = picture_.num_ref_frames;
     /* iq_matrix_ is sticky: clients may send it once per sequence. */
     pending_slice_params_.clear();
     slice_bytes_.clear();
     first_slice_.reset();
-    return access_unit;
+
+    if (max_num_reorder_frames_) {
+        result.access_units.push_back(serialize(unit, *max_num_reorder_frames_));
+        return result;
+    }
+
+    held_.push_back(std::move(unit));
+    if (held_.size() >= kMaxHeldAccessUnits) {
+        /* The client is feeding ahead, so it is not waiting on us and cannot
+         * deadlock; stop holding and keep the conservative bound. */
+        result.access_units = flush_held(std::nullopt);
+    }
+    return result;
 }
 
 } // namespace stateful

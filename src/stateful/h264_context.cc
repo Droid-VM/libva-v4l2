@@ -100,6 +100,17 @@ StatefulH264Context::~StatefulH264Context()
             }
         }
     }
+    /* D91: anything still held must reach the codec before the EOS drain. */
+    {
+        std::vector<std::pair<uint64_t, std::vector<uint8_t>>> units;
+        {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            if (au_builder_.held_count() > 0) {
+                units = take_held_locked(std::nullopt);
+            }
+        }
+        submit_access_units(nullptr, units);
+    }
     session_.finish();
 }
 
@@ -147,31 +158,64 @@ void StatefulH264Context::stateful_begin_picture(Surface& surface)
     }
 }
 
+/* D91: pair what the builder released with the sequences it was holding. */
+std::vector<std::pair<uint64_t, std::vector<uint8_t>>> StatefulH264Context::take_held_locked(
+    std::optional<unsigned> reorder)
+{
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> units;
+    auto access_units = au_builder_.flush_held(reorder);
+    for (auto& access_unit : access_units) {
+        units.emplace_back(held_sequences_.front(), std::move(access_unit));
+        held_sequences_.erase(held_sequences_.begin());
+    }
+    return units;
+}
+
+void StatefulH264Context::submit_access_units(
+    VADriverContextP va_context, std::vector<std::pair<uint64_t, std::vector<uint8_t>>>& units)
+{
+    for (auto& [sequence, access_unit] : units) {
+        try {
+            session_.submit(sequence, access_unit);
+        } catch (const std::exception& e) {
+            /* Teardown paths pass no VA context (nothing to log through). */
+            if (va_context != nullptr) {
+                error_log(va_context, "Failed to submit access unit: %s\n", e.what());
+            }
+            return;
+        }
+    }
+}
+
 VAStatus StatefulH264Context::stateful_end_picture(VADriverContextP va_context, Surface& surface)
 {
-    std::vector<uint8_t> access_unit;
+    uint64_t sequence;
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> units;
     try {
         std::lock_guard<std::mutex> guard(builder_mutex_);
-        access_unit = au_builder_.finish(surface.width, surface.height);
+        auto finished = au_builder_.finish(surface.width, surface.height);
+        if (!finished.had_picture) {
+            error_log(va_context, "vaEndPicture without picture parameters or slices\n");
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        sequence = next_sequence_++;
+        held_sequences_.push_back(sequence);
+        for (auto& access_unit : finished.access_units) {
+            units.emplace_back(held_sequences_.front(), std::move(access_unit));
+            held_sequences_.erase(held_sequences_.begin());
+        }
     } catch (const std::exception& e) {
         error_log(va_context, "Failed to synthesize access unit: %s\n", e.what());
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
-    if (access_unit.empty()) {
-        error_log(va_context, "vaEndPicture without picture parameters or slices\n");
-        return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
 
-    uint64_t sequence;
-    {
-        std::lock_guard<std::mutex> guard(builder_mutex_);
-        sequence = next_sequence_++;
-    }
-    try {
-        session_.submit(sequence, access_unit);
-    } catch (const std::exception& e) {
-        error_log(va_context, "Failed to submit access unit: %s\n", e.what());
-        return session_.dead() ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_OPERATION_FAILED;
+    for (auto& [seq, access_unit] : units) {
+        try {
+            session_.submit(seq, access_unit);
+        } catch (const std::exception& e) {
+            error_log(va_context, "Failed to submit access unit: %s\n", e.what());
+            return session_.dead() ? VA_STATUS_ERROR_DECODING_ERROR : VA_STATUS_ERROR_OPERATION_FAILED;
+        }
     }
 
     surface.stateful_context = this;
@@ -189,6 +233,31 @@ VAStatus StatefulH264Context::sync_surface(VADriverContextP va_context, Surface&
          * must recreate the context. */
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
+
+    /* D91: this is the observation the whole fix rests on. The client has
+     * stopped feeding and is asking for a frame, so the number of pictures it
+     * submitted first IS its reorder depth plus one -- it hands out a frame
+     * exactly when its own reordering can. Serialise the held access units
+     * with that depth in the VUI and queue them; from here the builder writes
+     * it straight into every access unit and holds nothing. */
+    {
+        std::vector<std::pair<uint64_t, std::vector<uint8_t>>> units;
+        {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            if (au_builder_.held_count() > 0) {
+                const unsigned reorder = static_cast<unsigned>(au_builder_.held_count() - 1);
+                if (!reorder_logged_.exchange(true)) {
+                    info_log(va_context,
+                        "stateful H.264: the client fed %zu access units before its first sync -- "
+                        "max_num_reorder_frames %u\n",
+                        au_builder_.held_count(), reorder);
+                }
+                units = take_held_locked(reorder);
+            }
+        }
+        submit_access_units(va_context, units);
+    }
+
     if (surface.status != VASurfaceRendering) {
         return VA_STATUS_SUCCESS;
     }
@@ -220,6 +289,20 @@ VAStatus StatefulH264Context::sync_surface(VADriverContextP va_context, Surface&
 
 void StatefulH264Context::release_surface(Surface& surface)
 {
+    /* D91: a held access unit still has to reach the codec -- later pictures
+     * reference it -- so release it before the surface goes. The client never
+     * synced, so there is nothing to observe: take the conservative bound. */
+    {
+        std::vector<std::pair<uint64_t, std::vector<uint8_t>>> units;
+        {
+            std::lock_guard<std::mutex> guard(builder_mutex_);
+            if (au_builder_.held_count() > 0) {
+                units = take_held_locked(std::nullopt);
+            }
+        }
+        submit_access_units(nullptr, units);
+    }
+
     if (surface.stateful_capture_index >= 0) {
         session_.release_frame(
             { static_cast<unsigned>(surface.stateful_capture_index), surface.stateful_capture_generation });
