@@ -25,6 +25,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -70,11 +71,17 @@ public:
         unsigned output_ring_size = 8;
         /* < 0: LIBVA_V4L2_SYNC_TIMEOUT_MS or the 500 ms default (point 5b). */
         int sync_timeout_ms = -1;
-        /* D85: how long a sync waits with NO new submission arriving before
-         * draining (a B-frame stream's tail is held by the codec until a
-         * drain -- VA-API has no EOS call, so the tail can only come out
-         * this way). While input keeps flowing the sync waits up to
-         * sync_timeout_ms instead. < 0: LIBVA_V4L2_SYNC_IDLE_MS or 50. */
+        /* D85: how long the pipeline must be QUIET -- no new access unit
+         * submitted AND no new decoded frame dequeued -- before a waiting sync
+         * drains. VA-API has no EOS call, so a tail the codec holds can only be
+         * shaken loose by a drain, and a quiet pipeline is the only end-of-
+         * stream signal this interface has. That makes it a GUESS; the hard
+         * cap alone never drains (it only feeds the backstop), because a drain
+         * in the middle of a live stream resets the codec and cuts the
+         * reference chain. Default 50 ms: on the AVC path that is now dormant
+         * (crosvm puts the codec in decode order, so it holds nothing -- D91),
+         * and where no mid-stream drain can fire (AV1/VP9) it only sets the
+         * poll cadence. < 0: LIBVA_V4L2_SYNC_IDLE_MS or the default. */
         int sync_idle_ms = -1;
         /* D85/D86: the mid-stream idle/timeout DEC_CMD_STOP drain
          * (recover_locked) exists for H.264, whose reorder tail the codec holds
@@ -186,6 +193,7 @@ public:
     unsigned idle_drains() const { return idle_drains_; }
     int sync_timeout_ms() const { return sync_timeout_ms_; }
     int sync_idle_ms() const { return sync_idle_ms_; }
+    int midstream_stall_ms() const { return midstream_stall_ms_; }
     bool allow_midstream_drain() const { return allow_midstream_drain_; }
     StatefulDevice& device() { return device_; }
 
@@ -229,6 +237,18 @@ private:
     unsigned output_ring_size_;
     int sync_timeout_ms_;
     int sync_idle_ms_;
+    /* D85: the mid-stream drain's anti-deadlock backstop. sync_timeout_ms_ is
+     * measured from the start of ONE sync, so on the drain path it cannot be
+     * the drain trigger: a paced client legitimately needs longer than it to
+     * feed the access units a waiting sync's frame depends on, and draining
+     * there is exactly the reference-chain cut of D85. The trigger is the quiet
+     * window (sync_idle_ms_); this is only the cap that stops a sync waiting
+     * forever when the pipeline keeps MOVING and our frame never comes -- the
+     * 'sync timeout' of 7.6 point 5b, whose bar stays 0 on every clip. Derived
+     * as max(sync_timeout_ms_, 3 x sync_idle_ms_): strictly above the quiet
+     * window, so an end-of-stream tail is always counted as the idle drain it
+     * is. */
+    int midstream_stall_ms_;
     bool allow_midstream_drain_;
     int provision_retry_ms_;
     uint32_t output_pixelformat_;
@@ -263,8 +283,31 @@ private:
     std::set<uint64_t> unwanted_sequences_;
     std::set<unsigned> client_owned_; /* claimed CAPTURE indices */
     uint64_t submit_count_ = 0; /* total submits; syncs watch it for input flow (D85) */
+    /* D85: total CAPTURE buffers dequeued from the device. A sync watches it
+     * alongside submit_count_: a device still handing frames back is not at
+     * end of stream, whoever the frames belong to. */
+    uint64_t decoded_count_ = 0;
+    uint64_t claim_count_ = 0; /* frames actually handed to the client */
     unsigned timeout_recoveries_ = 0;
     unsigned idle_drains_ = 0;
+
+    /* LIBVA_V4L2_SYNC_STATS=1 only (default off, and then this whole block is
+     * dead): the inter-submit gap distribution of the client and the longest
+     * quiet window a sync sat through, logged once per session by finish().
+     * This is the measurement the D85 threshold is chosen from -- a paced
+     * client's real pacing, from the backend's own side of the interface. */
+    bool sync_stats_ = false;
+    bool have_last_submit_ = false;
+    std::chrono::steady_clock::time_point last_submit_at_ {};
+    static constexpr unsigned kGapBuckets = 13;
+    unsigned gap_histogram_[kGapBuckets] = {};
+    unsigned gap_count_ = 0;
+    long long gap_sum_ms_ = 0;
+    int gap_max_ms_ = 0;
+    int quiet_max_ms_ = 0; /* longest no-input-no-output window seen inside a sync */
+    void record_submit_gap_locked();
+    void note_quiet_locked(int quiet_ms);
+    void log_sync_stats_locked();
 };
 
 } // namespace stateful

@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <system_error>
 #include <thread>
 
@@ -44,6 +45,32 @@ namespace {
     using Clock = std::chrono::steady_clock;
 
     constexpr int kDefaultSyncTimeoutMs = 500;
+    /* D85: the quiet window that stands in for the end-of-stream signal VA-API
+     * does not have. A waiting sync drains only once the pipeline has been
+     * quiet -- no new access unit submitted AND no decoded frame dequeued --
+     * for this long; the hard cap (sync_timeout_ms_) never drains on its own
+     * any more, it only feeds the backstop (midstream_stall_ms_).
+     *
+     * 50 ms, the value it always had, and here is why it is not larger. The one
+     * client this window was measured to hurt (Firefox MSE, adaptive High
+     * profile) was never pausing on its own pacing: it was BLOCKED IN THE SYNC,
+     * waiting for the picture it had just submitted while the codec held that
+     * picture for display-order reorder (self-delay p95 = 7 access units
+     * against a 7-8 feed-ahead). Sweeping this window over 50/1000/3000/8000 ms
+     * left that outcome bit-identical (8 access units fed, 2 drains, one failed
+     * sync, software fallback) and only stretched the wall clock
+     * (logs/vpu_wp/D85-drain.md): no threshold can tell that stall from end of
+     * stream. What removed it is upstream of this file -- crosvm now configures
+     * the AVC decoder for decode-order output (vendor.qti-ext-dec-picture-order,
+     * logs/vpu_wp/D91-deploy.md; the device ledger prints "picture-order on").
+     * With that, nothing is held mid-stream and the reorder tail is not held at
+     * end of stream either: every shipped path measured (three H.264 clips,
+     * h264.html, MSE adaptive High, YouTube avc1) ran with this window firing
+     * zero drains. The window is dormant on those paths and stays only as the
+     * last-resort EOS guess for an AVC codec that does hold pictures (a device
+     * without that key, or one that ignores it); a larger value would just
+     * delay that one drain. Where no mid-stream drain can fire (AV1/VP9,
+     * allow_midstream_drain = false) it only bounds the poll slice. */
     constexpr int kDefaultSyncIdleMs = 50;
     constexpr int kDefaultProvisionRetryMs = 2000;
     constexpr int kProvisionRetryStepMs = 50;
@@ -81,6 +108,11 @@ namespace {
         return kDefaultSyncIdleMs;
     }
 
+    /* The gap histogram's upper edges, in ms (the last bucket is everything
+     * above). Log-ish spacing: the interesting range for a paced client runs
+     * from "back to back" to "a network hiccup". */
+    constexpr int kGapEdgesMs[] = { 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000 };
+
     int remaining_ms(Clock::time_point deadline)
     {
         auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
@@ -108,6 +140,7 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , output_ring_size_(std::max(options.output_ring_size, 2u))
     , sync_timeout_ms_(resolve_sync_timeout(options.sync_timeout_ms))
     , sync_idle_ms_(resolve_sync_idle(options.sync_idle_ms))
+    , midstream_stall_ms_(std::max(sync_timeout_ms_, 3 * sync_idle_ms_))
     , allow_midstream_drain_(options.allow_midstream_drain)
     , provision_retry_ms_(options.provision_retry_ms >= 0 ? options.provision_retry_ms : kDefaultProvisionRetryMs)
     , output_pixelformat_(coded_pixelformat)
@@ -115,6 +148,14 @@ StatefulSession::StatefulSession(StatefulDevice& device, uint32_t coded_pixelfor
     , coded_height_(coded_height)
 {
     /* Construction is single-threaded: the context does not exist yet. */
+
+    /* D85 measurement hook, default off and then entirely dead: with
+     * LIBVA_V4L2_SYNC_STATS=1 the session keeps the client's inter-submit gap
+     * distribution and prints it once at teardown, which is how the quiet
+     * window above is chosen from a real client rather than guessed. */
+    if (const char* env = getenv("LIBVA_V4L2_SYNC_STATS"); env != nullptr && env[0] != '\0' && env[0] != '0') {
+        sync_stats_ = true;
+    }
 
     /* Subscribe before streaming so the first SOURCE_CHANGE cannot be lost. */
     device_.subscribe_events();
@@ -605,6 +646,10 @@ void StatefulSession::handle_capture_locked(const DequeuedCapture& frame)
     if (frame.index == DequeuedCapture::no_buffer) {
         return; /* synthetic end-of-drain marker */
     }
+    /* D85: the device handed a buffer back, so it is still working -- whoever
+     * this frame belongs to, this is not end of stream. Counted before the
+     * empty/unwanted filters below for exactly that reason. */
+    decoded_count_ += 1;
     if (frame.bytesused == 0 || frame.error) {
         /* An empty LAST (or erroneous) buffer carries no frame; recycle it. */
         requeue_capture_locked(frame.index);
@@ -628,6 +673,7 @@ bool StatefulSession::claim_locked(uint64_t sequence, Frame* frame)
     frame->generation = generation_;
     client_owned_.insert(it->second);
     stash_.erase(it);
+    claim_count_ += 1;
     return true;
 }
 
@@ -767,6 +813,7 @@ void StatefulSession::submit(uint64_t sequence, std::span<const uint8_t> access_
         device_.queue_output(static_cast<unsigned>(index), sequence, access_unit.size());
         queued_outputs_ += 1;
         submit_count_ += 1; /* D85: waiting syncs watch this for input flow */
+        record_submit_gap_locked();
         cv_.notify_all();
     } catch (const DeviceLost&) {
         dead_ = true;
@@ -831,15 +878,16 @@ StatefulSession::SyncStatus StatefulSession::recover_locked(
         if (idle) {
             idle_drains_ += 1;
             snprintf(line, sizeof(line),
-                "idle drain after %d ms without new input on sequence %llu: DEC_CMD_STOP drain + restart "
-                "(occurrence %u, sync timeouts %u)",
+                "idle drain after %d ms idle (no new input, no new frames) on sequence %llu: "
+                "DEC_CMD_STOP drain + restart (occurrence %u, sync timeouts %u)",
                 sync_idle_ms_, static_cast<unsigned long long>(sequence), idle_drains_, timeout_recoveries_);
         } else {
             timeout_recoveries_ += 1;
             snprintf(line, sizeof(line),
                 "sync timeout after %d ms on sequence %llu: DEC_CMD_STOP drain + restart "
                 "(occurrence %u, idle drains %u)",
-                sync_timeout_ms_, static_cast<unsigned long long>(sequence), timeout_recoveries_, idle_drains_);
+                allow_midstream_drain_ ? midstream_stall_ms_ : sync_timeout_ms_,
+                static_cast<unsigned long long>(sequence), timeout_recoveries_, idle_drains_);
         }
         log(line);
 
@@ -888,14 +936,29 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
         return SyncStatus::dead;
     }
 
-    const auto deadline = Clock::now() + std::chrono::milliseconds(sync_timeout_ms_);
-    /* D85: wait while input is flowing (another thread submitted since the
-     * wait began), up to the hard cap; but once no new submission arrives
-     * for sync_idle_ms_, drain now -- the frame is either held back by the
-     * codec (the B-frame stream tail) or lost, and only a drain settles
-     * which. */
+    const auto started = Clock::now();
+    const auto deadline = started + std::chrono::milliseconds(sync_timeout_ms_);
+    /* D85: a sync waits while the PIPELINE IS MOVING -- another thread
+     * submitted an access unit, or the device handed a decoded buffer back --
+     * and drains only once both have been quiet for sync_idle_ms_. A quiet
+     * pipeline is the only end-of-stream signal VA-API gives this backend, and
+     * at end of stream a drain is the only way the client's sync of a tail
+     * frame can ever be satisfied (D85: the -bf 3 clip's last frames).
+     *
+     * The two clocks are deliberately different quantities:
+     *  - the quiet window restarts on every sign of life, so a client that
+     *    feeds in bursts -- every paced streaming client does -- is never
+     *    mistaken for a finished one;
+     *  - the backstop (midstream_stall_ms_) runs from the start of THIS sync
+     *    and never restarts, so a sync still cannot wait forever when the
+     *    pipeline keeps moving without ever producing our frame.
+     * The pre-D85 code used sync_timeout_ms_ itself as that second trigger,
+     * which is why a paced client was drained at 500 ms while it was feeding
+     * perfectly normally. */
     uint64_t submits_seen = submit_count_;
-    auto idle_since = Clock::now();
+    uint64_t decoded_seen = decoded_count_;
+    auto idle_since = started;
+    const auto stall_deadline = started + std::chrono::milliseconds(midstream_stall_ms_);
 
     try {
         while (true) {
@@ -911,6 +974,13 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             const auto now = Clock::now();
             if (submit_count_ != submits_seen) {
                 submits_seen = submit_count_;
+                idle_since = now;
+            }
+            if (allow_midstream_drain_ && decoded_count_ != decoded_seen) {
+                /* Only the drain path consults device output: on the AV1/VP9
+                 * path nothing is triggered by the quiet window, so leaving it
+                 * alone keeps those waits exactly what they were. */
+                decoded_seen = decoded_count_;
                 idle_since = now;
             }
             const auto idle_deadline = idle_since + std::chrono::milliseconds(sync_idle_ms_);
@@ -929,6 +999,8 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
             }
 
             const bool idle_expired = now >= idle_deadline;
+            note_quiet_locked(
+                static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - idle_since).count()));
             if (hard_expired || idle_expired) {
                 if (!allow_midstream_drain_) {
                     /* VP9 and AV1. VP9's display order is in-band
@@ -949,10 +1021,25 @@ StatefulSession::SyncStatus StatefulSession::sync(uint64_t sequence, Frame* fram
                     wait_for_progress(lock, std::min(kWaitSliceMs, remaining_ms(deadline) + 1), false);
                     continue;
                 }
-                return recover_locked(lock, sequence, frame, idle_expired && !hard_expired);
+            }
+            if (allow_midstream_drain_) {
+                /* D85: the quiet window is the end-of-stream guess and the
+                 * backstop is the anti-deadlock cap; sync_timeout_ms_ on its
+                 * own decides nothing on this path any more. */
+                const bool stalled = now >= stall_deadline;
+                if (idle_expired || stalled) {
+                    return recover_locked(lock, sequence, frame, !stalled);
+                }
             }
 
-            int slice = std::min({ kWaitSliceMs, remaining_ms(deadline) + 1, remaining_ms(idle_deadline) + 1 });
+            int slice = kWaitSliceMs;
+            const auto cap = allow_midstream_drain_ ? stall_deadline : deadline;
+            if (now < cap) {
+                slice = std::min(slice, remaining_ms(cap) + 1);
+            }
+            if (!idle_expired) {
+                slice = std::min(slice, remaining_ms(idle_deadline) + 1);
+            }
             wait_for_progress(lock, slice, false);
         }
     } catch (const DeviceLost&) {
@@ -1023,6 +1110,81 @@ void StatefulSession::drop_sequence(uint64_t sequence)
     unwanted_sequences_.insert(sequence);
 }
 
+void StatefulSession::record_submit_gap_locked()
+{
+    if (!sync_stats_) {
+        return;
+    }
+    const auto now = Clock::now();
+    if (have_last_submit_) {
+        const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_submit_at_).count();
+        const int gap_ms = gap > 0 ? static_cast<int>(gap) : 0;
+        unsigned bucket = kGapBuckets - 1;
+        for (unsigned i = 0; i < kGapBuckets - 1; i++) {
+            if (gap_ms <= kGapEdgesMs[i]) {
+                bucket = i;
+                break;
+            }
+        }
+        gap_histogram_[bucket] += 1;
+        gap_count_ += 1;
+        gap_sum_ms_ += gap_ms;
+        gap_max_ms_ = std::max(gap_max_ms_, gap_ms);
+    }
+    last_submit_at_ = now;
+    have_last_submit_ = true;
+}
+
+void StatefulSession::note_quiet_locked(int quiet_ms)
+{
+    if (sync_stats_ && quiet_ms > quiet_max_ms_) {
+        quiet_max_ms_ = quiet_ms;
+    }
+}
+
+void StatefulSession::log_sync_stats_locked()
+{
+    if (!sync_stats_) {
+        return;
+    }
+    /* Percentiles come off the histogram, so they are reported as the bucket's
+     * upper edge ("<= N ms") and never invented: the point of the line is the
+     * SHAPE of a client's pacing against the quiet window, not a fitted number.
+     * submits vs claims answers the other half of the D85 question -- whether a
+     * client syncs its tail before it destroys the context (equal) or walks
+     * away from frames it submitted (claims short). */
+    auto percentile = [this](double fraction) -> int {
+        const unsigned target = static_cast<unsigned>(fraction * gap_count_);
+        unsigned seen = 0;
+        for (unsigned i = 0; i < kGapBuckets; i++) {
+            seen += gap_histogram_[i];
+            if (seen >= target && gap_histogram_[i] > 0) {
+                return i < kGapBuckets - 1 ? kGapEdgesMs[i] : -1; /* -1: the overflow bucket */
+            }
+        }
+        return 0;
+    };
+
+    std::string line = "sync stats: submits " + std::to_string(submit_count_) + ", claims "
+        + std::to_string(claim_count_) + ", frames out " + std::to_string(decoded_count_)
+        + "; submit gaps p50 <=" + std::to_string(percentile(0.5)) + " ms p95 <=" + std::to_string(percentile(0.95))
+        + " ms max " + std::to_string(gap_max_ms_) + " ms mean "
+        + std::to_string(gap_count_ > 0 ? gap_sum_ms_ / static_cast<long long>(gap_count_) : 0)
+        + " ms; longest quiet window inside a sync " + std::to_string(quiet_max_ms_) + " ms (threshold "
+        + std::to_string(sync_idle_ms_) + " ms, backstop " + std::to_string(midstream_stall_ms_) + " ms); idle drains "
+        + std::to_string(idle_drains_) + ", sync timeouts " + std::to_string(timeout_recoveries_) + "; histogram";
+    for (unsigned i = 0; i < kGapBuckets; i++) {
+        if (gap_histogram_[i] == 0) {
+            continue;
+        }
+        line += " ";
+        line += (i == kGapBuckets - 1) ? ">" + std::to_string(kGapEdgesMs[kGapBuckets - 2])
+                                       : "<=" + std::to_string(kGapEdgesMs[i]);
+        line += ":" + std::to_string(gap_histogram_[i]);
+    }
+    log(line.c_str());
+}
+
 void StatefulSession::finish()
 {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -1068,6 +1230,8 @@ void StatefulSession::finish()
     free_outputs_.clear();
     usable_outputs_.clear();
     queued_outputs_ = 0;
+
+    log_sync_stats_locked();
 
     harvesting_ = false;
     cv_.notify_all();
