@@ -45,6 +45,7 @@ sources = [
 	'media.cc',
 	'v4l2.cc',
 	'device_scan.cc',
+	'profile_menu.cc',
 	'mpeg2.cc',
 	'h264.cc',
 	'vp8.cc',
@@ -73,6 +74,7 @@ headers = [
 	'media.h',
 	'v4l2.h',
 	'device_scan.h',
+	'profile_menu.h',
 	'mpeg2.h',
 	'h264.h',
 	'vp8.h',
@@ -229,6 +231,17 @@ test_device_scan = executable('test_device_scan',
 	cpp_args: cpp_args,
 	dependencies: [ kernel_dep ])
 test('device-scan', test_device_scan)
+
+# VA1b (VPU_DESIGN.md 7.6 point 2): the profile intersection. The bridge's
+# implemented set narrowed by the device's V4L2 profile menu -- pure mapping
+# and set logic, driven from menu values with no device, so the rule that the
+# device can only narrow (and that a silent device narrows nothing) is pinned
+# without a /dev.
+test_profile_menu = executable('test_profile_menu',
+	[ '../test/stateful/test_profile_menu.cc', 'profile_menu.cc' ],
+	cpp_args: cpp_args,
+	dependencies: [ libva_dep, kernel_dep ])
+test('profile-menu', test_profile_menu)
 
 dl_dep = cc.find_library('dl', required: false)
 

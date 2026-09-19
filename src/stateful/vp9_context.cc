@@ -38,6 +38,7 @@ extern "C" {
 }
 
 #include "../driver.h"
+#include "../profile_menu.h"
 #include "../utils.h"
 #include "prime_descriptor.h"
 
@@ -70,9 +71,14 @@ stateful::StatefulSession::Options session_options(
 
 std::set<VAProfile> StatefulVP9Context::supported_profiles(const V4L2M2MDevice& device)
 {
-    return (device.stateful_decoder() && device.format_supported(device.output_buf_type, V4L2_PIX_FMT_VP9))
-        ? std::set<VAProfile> { VAProfileVP9Profile0 }
-        : std::set<VAProfile>();
+    if (!device.stateful_decoder() || !device.format_supported(device.output_buf_type, V4L2_PIX_FMT_VP9)) {
+        return {};
+    }
+    /* VA1b: Profile 0 is what this bridge implements (vp9_bitstream.cc rebuilds
+     * the 8-bit 4:2:0 uncompressed header); a device that lists Profile 2 as
+     * well still gets Profile 0 only. */
+    return profile_menu::supported_profiles(
+        V4L2_CID_MPEG_VIDEO_VP9_PROFILE, { VAProfileVP9Profile0 }, device.profile_menu(V4L2_PIX_FMT_VP9));
 }
 
 StatefulVP9Context::StatefulVP9Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile,

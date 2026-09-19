@@ -36,6 +36,7 @@ extern "C" {
 }
 
 #include "../driver.h"
+#include "../profile_menu.h"
 #include "../utils.h"
 #include "prime_descriptor.h"
 
@@ -64,11 +65,18 @@ stateful::StatefulSession::Options session_options(
 
 std::set<VAProfile> StatefulH264Context::supported_profiles(const V4L2M2MDevice& device)
 {
-    /* See the header: the VA1 hardcode replaced by device profile menus in
-     * VA1b (VPU_DESIGN.md 7.6 point 2). */
-    return (device.stateful_decoder() && device.format_supported(device.output_buf_type, V4L2_PIX_FMT_H264))
-        ? std::set<VAProfile> { VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High }
-        : std::set<VAProfile>();
+    if (!device.stateful_decoder() || !device.format_supported(device.output_buf_type, V4L2_PIX_FMT_H264)) {
+        return {};
+    }
+    /* VA1b (VPU_DESIGN.md 7.6 point 2): the VA1 list is now only the half
+     * that says what THIS bridge implements -- the bitstream synthesis in
+     * h264_bitstream.cc writes exactly these three. The device's profile menu
+     * narrows it to what the codec behind the device can really decode, and
+     * can never widen it: a device that lists High 10 gets no High 10 here,
+     * because nothing would synthesise it. */
+    return profile_menu::supported_profiles(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+        { VAProfileH264ConstrainedBaseline, VAProfileH264Main, VAProfileH264High },
+        device.profile_menu(V4L2_PIX_FMT_H264));
 }
 
 StatefulH264Context::StatefulH264Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile,

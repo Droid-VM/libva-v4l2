@@ -217,7 +217,114 @@ std::optional<device_scan::NodeProbe> probe_video_node(const std::string& path)
     return result;
 }
 
+/*
+ * VA1b (VPU_DESIGN.md 7.6 point 2): read one coded format's profile menu.
+ *
+ * The menu is per coded format -- one control id, a different answer once the
+ * OUTPUT queue is set to H.264 than to AV1 -- so the format has to be selected
+ * before the control is queried, and that is a change of session state. Doing
+ * it on the display-wide fd would S_FMT a queue that a context may already own
+ * (P-6b: one V4L2 open is one codec session), so the probe opens the node once
+ * more, sets the format with no buffers on it, sweeps the menu and closes.
+ * Nothing it does can be seen by any other session.
+ *
+ * nullopt on every failure -- the node cannot be opened a second time, the
+ * format is refused, the control does not exist (ENOTTY/EINVAL from an older
+ * device that never learned to publish profiles), or it exists but is not a
+ * menu. "No information" is not "no profiles": the caller keeps what the
+ * bridge implements.
+ */
+profile_menu::DeviceMenu probe_profile_menu(
+    const std::string& path, v4l2_buf_type output_type, fourcc pixelformat, uint32_t control_id)
+{
+    int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+
+    profile_menu::DeviceMenu result;
+    do {
+        /* Start from the driver's own OUTPUT format and change only the coded
+         * format, so nothing here depends on guessing a width or a plane
+         * layout the device would have to correct. */
+        v4l2_format format = { .type = static_cast<uint32_t>(output_type) };
+        if (ioctl(fd, VIDIOC_G_FMT, &format) < 0) {
+            break;
+        }
+        format.fmt.pix_mp.pixelformat = pixelformat;
+        format.fmt.pix_mp.plane_fmt[0].sizeimage = SOURCE_SIZE_MAX;
+        if (ioctl(fd, VIDIOC_S_FMT, &format) < 0) {
+            break;
+        }
+        if (format.fmt.pix_mp.pixelformat != pixelformat) {
+            break; /* the device substituted another format: it is not set up for this one */
+        }
+
+        v4l2_query_ext_ctrl query = { .id = control_id };
+        if (ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &query) < 0) {
+            break; /* ENOTTY/EINVAL: an older device, with no profile menu at all */
+        }
+        if (query.type != V4L2_CTRL_TYPE_MENU || (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
+            break; /* not a menu, or a menu the device says does not apply here */
+        }
+
+        /* QUERYMENU over the control's own range: an item the device supports
+         * answers, the rest answer EINVAL. The cap only bounds a device that
+         * reports a nonsense range -- a real profile menu is a handful of
+         * items (the widest upstream one, H.264, has 18). */
+        constexpr int64_t kMaxMenuItems = 64;
+        std::set<uint32_t> values;
+        const int64_t last = std::min<int64_t>(query.maximum, query.minimum + kMaxMenuItems - 1);
+        for (int64_t value = std::max<int64_t>(query.minimum, 0); value <= last; value += 1) {
+            v4l2_querymenu menu = { .id = control_id, .index = static_cast<uint32_t>(value) };
+            if (ioctl(fd, VIDIOC_QUERYMENU, &menu) == 0) {
+                values.insert(menu.index);
+            }
+        }
+        result = std::move(values);
+    } while (false);
+
+    close(fd);
+    return result;
+}
+
 } // namespace
+
+profile_menu::DeviceMenu V4L2M2MDevice::profile_menu(fourcc pixelformat) const
+{
+    const auto it = profile_menus.find(pixelformat);
+    return (it == profile_menus.end()) ? std::nullopt : it->second;
+}
+
+std::string V4L2M2MDevice::profile_menu_log_line() const
+{
+    if (profile_menus.empty()) {
+        return {};
+    }
+
+    std::string reported;
+    std::string silent;
+    for (auto&& [pixelformat, menu] : profile_menus) {
+        const char name[] = { static_cast<char>(pixelformat & 0xff), static_cast<char>((pixelformat >> 8) & 0xff),
+            static_cast<char>((pixelformat >> 16) & 0xff), static_cast<char>((pixelformat >> 24) & 0xff), '\0' };
+        if (menu && !menu->empty()) {
+            reported += reported.empty() ? "" : ", ";
+            reported += name;
+            reported += " (" + std::to_string(menu->size()) + " item(s))";
+        } else {
+            silent += silent.empty() ? "" : ", ";
+            silent += name;
+        }
+    }
+
+    std::string line = video_path + ": profile menus reported for " + (reported.empty() ? "nothing" : reported);
+    if (!silent.empty()) {
+        /* The fallback, said once and plainly: these formats keep the profile
+         * set this bridge implements because the device did not report one. */
+        line += "; " + silent + " did not report profiles, keeping the implemented set";
+    }
+    return line;
+}
 
 bool V4L2M2MDevice::stateful_decoder() const
 {
@@ -408,6 +515,19 @@ V4L2M2MDevice::V4L2M2MDevice(const std::string& video_path, const std::optional<
     if (!(capabilities & required_capabilities)) {
         std::runtime_error("Missing device capabilities");
     }
+
+    /* VA1b: read the device's profile menus once, here, for each coded format
+     * this bridge implements AND the device supports. A format the device does
+     * not list is not probed at all (no entry), which reads the same as "no
+     * information" -- the contexts already refuse such a format on the fourcc
+     * test alone. */
+    for (auto&& pixelformat : { V4L2_PIX_FMT_H264, V4L2_PIX_FMT_VP9, V4L2_PIX_FMT_AV1 }) {
+        const auto control_id = profile_menu::control_for_format(pixelformat);
+        if (!control_id || !format_supported(output_buf_type, pixelformat)) {
+            continue;
+        }
+        profile_menus.emplace(pixelformat, probe_profile_menu(video_path, output_buf_type, pixelformat, *control_id));
+    }
 }
 
 V4L2M2MDevice::V4L2M2MDevice(V4L2M2MDevice&& other)
@@ -421,6 +541,7 @@ V4L2M2MDevice::V4L2M2MDevice(V4L2M2MDevice&& other)
     , output_format(std::move(other.output_format))
     , supported_output_formats(std::move(other.supported_output_formats))
     , supported_capture_formats(std::move(other.supported_capture_formats))
+    , profile_menus(std::move(other.profile_menus))
     , capture_buffers(std::move(other.capture_buffers))
     , output_buffers(std::move(other.output_buffers))
 {

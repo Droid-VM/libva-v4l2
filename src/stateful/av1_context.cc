@@ -38,6 +38,7 @@ extern "C" {
 }
 
 #include "../driver.h"
+#include "../profile_menu.h"
 #include "../utils.h"
 #include "prime_descriptor.h"
 
@@ -84,9 +85,13 @@ stateful::StatefulSession::Options session_options(
 
 std::set<VAProfile> StatefulAV1Context::supported_profiles(const V4L2M2MDevice& device)
 {
-    return (device.stateful_decoder() && device.format_supported(device.output_buf_type, V4L2_PIX_FMT_AV1))
-        ? std::set<VAProfile> { VAProfileAV1Profile0 }
-        : std::set<VAProfile>();
+    if (!device.stateful_decoder() || !device.format_supported(device.output_buf_type, V4L2_PIX_FMT_AV1)) {
+        return {};
+    }
+    /* VA1b: Profile 0 is what av1_bitstream.cc re-synthesises; a device that
+     * also lists HIGH (profile 1) gets Profile 0 only. */
+    return profile_menu::supported_profiles(
+        V4L2_CID_MPEG_VIDEO_AV1_PROFILE, { VAProfileAV1Profile0 }, device.profile_menu(V4L2_PIX_FMT_AV1));
 }
 
 StatefulAV1Context::StatefulAV1Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile,

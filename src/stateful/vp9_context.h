@@ -64,11 +64,13 @@ struct DriverData;
 class StatefulVP9Context final : public Context {
 public:
     /* Advertise VAProfileVP9Profile0 when the device is a stateful decoder that
-     * advertises V4L2_PIX_FMT_VP9 ('VP90'). The device/driver are already
-     * codec-agnostic (VA2-survey (A)/(D)): /dev/video0 lists VP90 and the
-     * c2.qti.vp9.decoder is hardware, announcing at 1 access unit. Profile2
-     * (10/12-bit) is a follow-up: the device advertises only the VP90 fourcc
-     * with no bit-depth caps to gate it, and CAPTURE is 8-bit NV12. */
+     * advertises V4L2_PIX_FMT_VP9 ('VP90') AND its profile menu lists Profile 0
+     * (VA1b, 7.6 point 2; a device with no such menu keeps this set). The
+     * device/driver are already codec-agnostic (VA2-survey (A)/(D)):
+     * /dev/video0 lists VP90 and the c2.qti.vp9.decoder is hardware,
+     * announcing at 1 access unit. Profile2 (10/12-bit) is a follow-up and
+     * stays out even where the device's menu lists it: nothing here rebuilds a
+     * 10-bit uncompressed header, and CAPTURE is 8-bit NV12. */
     static std::set<VAProfile> supported_profiles(const V4L2M2MDevice& device);
 
     StatefulVP9Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile, int picture_width,
