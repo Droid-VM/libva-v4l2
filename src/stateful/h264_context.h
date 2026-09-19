@@ -52,12 +52,14 @@ struct DriverData;
 class StatefulH264Context final : public Context {
 public:
     /*
-     * The VA1 profile hardcode (7.6 point 2): the virtio-media decoder
-     * exposes no profile/level controls (its only control is the read-only
-     * MIN_BUFFERS_FOR_CAPTURE), so a stateful node advertising
-     * V4L2_PIX_FMT_H264 gets this fixed list. VA1b replaces this table by
-     * reading the V4L2_CID_MPEG_VIDEO_H264_PROFILE menu once the device
-     * exposes MediaCodec's real capabilities.
+     * VA1b (7.6 point 2): ConstrainedBaseline/Main/High is what this bridge
+     * IMPLEMENTS -- the three profiles h264_bitstream.cc can synthesise SPS/PPS
+     * for -- intersected with the device's V4L2_CID_MPEG_VIDEO_H264_PROFILE
+     * menu, which is MediaCodec's real capability. The VA1 hardcode was this
+     * list with no second half, because the decoder device then had no profile
+     * control at all (its only control was the read-only
+     * MIN_BUFFERS_FOR_CAPTURE); a device that still has none is handled by
+     * profile_menu::supported_profiles(), which keeps the implemented set.
      */
     static std::set<VAProfile> supported_profiles(const V4L2M2MDevice& device);
 

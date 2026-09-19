@@ -111,6 +111,15 @@ extern "C" VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
     const bool stateful = std::ranges::any_of(
         driver_data->devices, [](const V4L2M2MDevice& device) { return device.stateful_decoder(); });
 
+    /* VA1b (VPU_DESIGN.md 7.6 point 2): say once, per device, what its profile
+     * menus reported -- and name the formats that reported nothing, which are
+     * the ones still advertised from the set this bridge implements. */
+    for (auto&& device : driver_data->devices) {
+        if (const auto line = device.profile_menu_log_line(); !line.empty()) {
+            info_log(context, "VA1b profiles: %s\n", line.c_str());
+        }
+    }
+
     struct VADriverVTable* vtable = context->vtable;
 
     context->version_major = VA_MAJOR_VERSION;

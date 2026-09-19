@@ -26,10 +26,19 @@
  * VPU_DESIGN.md 7.6 host verification: confirm the driver loads and probes
  * cleanly with no /dev/videoN present (vainfo-style dlopen), i.e.
  * vaInitialize fails without a crash rather than segfaulting.
+ *
+ * VA1b (7.6 point 2) put more work in that probe -- V4L2M2MDevice's
+ * constructor now opens the node a second time per coded format to read the
+ * profile menus -- so this runs the init twice: once against a node that does
+ * not exist (open fails), and once against a node that opens but is not a V4L2
+ * device at all (/dev/null: QUERYCAP fails, and the profile probe must never
+ * be reached, let alone crash or hang on it). Both must return the same clean
+ * VA_STATUS_ERROR_OPERATION_FAILED.
  */
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 extern "C" {
 #include <dlfcn.h>
@@ -52,10 +61,6 @@ int main(int argc, char** argv)
     REQUIRE(argc >= 2);
     const char* module_path = argv[1];
 
-    /* No device: make enumeration find nothing and the override point at a
-     * path that does not exist. */
-    setenv("LIBVA_V4L2_VIDEO_PATH", "/dev/does-not-exist-videoN", 1);
-
     void* handle = dlopen(module_path, RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         fprintf(stderr, "FATAL: dlopen(%s) failed: %s\n", module_path, dlerror());
@@ -71,23 +76,30 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    VADriverContext context = {};
-    VADriverVTable vtable = {};
-    context.vtable = &vtable;
-    context.version_major = VA_MAJOR_VERSION;
-    context.version_minor = VA_MINOR_VERSION;
-    context.error_callback = fake_error;
-    context.info_callback = fake_info;
+    /* A node that cannot be opened, then a node that opens and answers no V4L2
+     * ioctl. Both make enumeration find nothing usable. */
+    for (auto&& video_path : { "/dev/does-not-exist-videoN", "/dev/null" }) {
+        setenv("LIBVA_V4L2_VIDEO_PATH", video_path, 1);
 
-    /* The whole point: this returns (any status) without crashing. */
-    VAStatus status = init(&context);
-    printf("vaDriverInit with no device returned 0x%x\n", status);
+        VADriverContext context = {};
+        VADriverVTable vtable = {};
+        context.vtable = &vtable;
+        context.version_major = VA_MAJOR_VERSION;
+        context.version_minor = VA_MINOR_VERSION;
+        context.error_callback = fake_error;
+        context.info_callback = fake_info;
 
-    if (status == VA_STATUS_SUCCESS && vtable.vaTerminate != nullptr) {
-        vtable.vaTerminate(&context);
+        /* The whole point: this returns (any status) without crashing. */
+        VAStatus status = init(&context);
+        printf("vaDriverInit with %s returned 0x%x\n", video_path, status);
+
+        if (status == VA_STATUS_SUCCESS && vtable.vaTerminate != nullptr) {
+            vtable.vaTerminate(&context);
+        }
+
+        CHECK(status == VA_STATUS_ERROR_OPERATION_FAILED);
     }
 
     dlclose(handle);
-    CHECK(status == VA_STATUS_ERROR_OPERATION_FAILED);
     return check_result("test_driver_probe");
 }

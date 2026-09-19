@@ -26,6 +26,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -35,6 +36,8 @@
 extern "C" {
 #include <linux/videodev2.h>
 }
+
+#include "profile_menu.h"
 
 #define SOURCE_SIZE_MAX (1024 * 1024)
 
@@ -87,6 +90,21 @@ public:
      * node and no Request API. */
     bool stateful_decoder() const;
 
+    /* VA1b (VPU_DESIGN.md 7.6 point 2): what this device's profile menu
+     * listed for one coded OUTPUT format. nullopt = no information -- the
+     * device has no such control (an older device), the probe could not run,
+     * or this format was never probed because the device does not support it
+     * -- and the caller keeps the set the bridge implements. Filled once at
+     * construction, so vaQueryConfigProfiles (which asks per call) costs no
+     * ioctl. */
+    profile_menu::DeviceMenu profile_menu(fourcc pixelformat) const;
+
+    /* One line for the driver-init log: which coded formats reported a
+     * profile menu and which did not. Empty when nothing was probed at all --
+     * the device lists none of the coded formats this bridge implements (a
+     * stateless node lists the _SLICE/_FRAME ones instead). */
+    std::string profile_menu_log_line() const;
+
     /* The node this device was opened on. A stateful context opens ITS OWN fd
      * on it (stateful/v4l2_device.cc): one V4L2 open is one codec session, and
      * the display-wide video_fd below is shared by every context of the
@@ -103,6 +121,11 @@ public:
     v4l2_format output_format;
     std::set<fourcc> supported_output_formats;
     std::set<fourcc> supported_capture_formats;
+    /* VA1b: the probed menus, by coded fourcc. A key with a nullopt value was
+     * probed and the device has no such control; a missing key was never
+     * probed. Both answer nullopt through profile_menu() above; the two are
+     * kept apart only so the init log can say which happened. */
+    std::map<fourcc, profile_menu::DeviceMenu> profile_menus;
 
 private:
     std::vector<Buffer> capture_buffers;

@@ -61,11 +61,13 @@ struct DriverData;
 class StatefulAV1Context final : public Context {
 public:
     /* Advertise VAProfileAV1Profile0 when the device is a stateful decoder that
-     * advertises V4L2_PIX_FMT_AV1 ('AV01'). The device/driver are already
-     * codec-agnostic (VA2-survey (A)/(D)): /dev/video0 lists AV01 and the
-     * c2.qti.av1.decoder is hardware, announcing at 1 access unit. Profile1/2
-     * (4:4:4 / 10-12 bit) are a follow-up: the device advertises only the AV01
-     * fourcc with no bit-depth caps to gate them, and CAPTURE is 8-bit NV12. */
+     * advertises V4L2_PIX_FMT_AV1 ('AV01') AND its profile menu lists MAIN
+     * (VA1b, 7.6 point 2; a device with no such menu keeps this set). The
+     * device/driver are already codec-agnostic (VA2-survey (A)/(D)):
+     * /dev/video0 lists AV01 and the c2.qti.av1.decoder is hardware,
+     * announcing at 1 access unit. Profile1/2 (4:4:4 / 10-12 bit) are a
+     * follow-up and stay out even where the device's menu lists HIGH: the OBU
+     * re-synthesis writes profile 0, and CAPTURE is 8-bit NV12. */
     static std::set<VAProfile> supported_profiles(const V4L2M2MDevice& device);
 
     StatefulAV1Context(DriverData* driver_data, V4L2M2MDevice& device, VAProfile profile, int picture_width,
